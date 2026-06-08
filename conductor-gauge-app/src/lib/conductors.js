@@ -29,11 +29,11 @@ export const TABLE = [
   {name:"Mullet", cons:"Mullet", type:"ACSR", mat:"Aluminium", csa:10, dia:4.37, est:true},
   {name:"Thrush", cons:"Thrush", type:"ACSR", mat:"Aluminium", csa:18, dia:5.86, est:true},
   {name:"Flounder", cons:"Flounder", type:"ACSR", mat:"Aluminium", csa:20, dia:6.18, est:true},
-  {name:"Squirrel", cons:"Squirrel", type:"ACSR", mat:"Aluminium", csa:21, dia:6.33, est:true},
+  {name:"Squirrel", cons:"Squirrel", type:"ACSR", mat:"Aluminium", csa:21, dia:6.33, est:false},
   {name:"Snipe", cons:"Snipe", type:"ACSR", mat:"Aluminium", csa:25, dia:6.91, est:true},
-  {name:"Ferret", cons:"Ferret", type:"ACSR", mat:"Aluminium", csa:42, dia:8.96, est:true},
-  {name:"Mink", cons:"Mink", type:"ACSR", mat:"Aluminium", csa:63, dia:10.97, est:true},
+  {name:"Ferret", cons:"Ferret", type:"ACSR", mat:"Aluminium", csa:42, dia:9.00, est:false},
+  {name:"Mink", cons:"Mink", type:"ACSR", mat:"Aluminium", csa:63, dia:10.98, est:false},
   {name:"Waxwing", cons:"Waxwing", type:"ACSR", mat:"Aluminium", csa:135, dia:16.57, est:true},
-  {name:"Dog", cons:"Dog", type:"ACSR", mat:"Aluminium", csa:103, dia:14.47, est:true},
+  {name:"Dog", cons:"Dog", type:"ACSR", mat:"Aluminium", csa:103, dia:14.15, est:false},
   {name:"Jaguar", cons:"Jaguar", type:"ACSR", mat:"Aluminium", csa:200, dia:20.17, est:true}
 ];

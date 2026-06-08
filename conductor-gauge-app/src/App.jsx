@@ -34,6 +34,7 @@ export default function App(){
   const [toast,setToast]     = useState('')
   const [parallax,setParallax] = useState(true)
   const [standoff,setStandoff] = useState(250)
+  const [calBar,setCalBar] = useState(100)   // measured length of the printed 100mm calibration bar
   const [canInstall,setCanInstall] = useState(false)
 
   const videoRef = useRef(null)
@@ -144,13 +145,15 @@ export default function App(){
   /* ---------- analysis ---------- */
   const finalize = useCallback((det)=>{
     let dia=det.dia
+    const cb = Math.max(50, calBar||100)
+    dia = dia * (cb/100)                       // print-scale correction from the calibration bar
     if(parallax){ const s=Math.max(60,standoff||250); dia=dia*(s-dia/2)/s }
     detRef.current=det; diaRef.current=dia
     const mat=det.matHint||material||'Aluminium'
     setMaterial(mat)
     setResult(computeMatch(dia,mat,det))
     setScreen('result')
-  },[parallax,standoff,material])
+  },[parallax,standoff,calBar,material])
 
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
@@ -328,6 +331,9 @@ export default function App(){
             <button className="btn ghost" onClick={()=>startCamera()}>Retake photo</button>
             <details>
               <summary>Advanced · parallax &amp; scale</summary>
+              <div className="field"><label>Measured calibration-bar length (mm)</label>
+                <input type="number" value={calBar} min={50} step={0.5} onChange={e=>setCalBar(parseFloat(e.target.value)||100)}/></div>
+              <p style={{fontSize:11}}>Measure the printed 100&nbsp;mm bar with a ruler and enter its actual length. Corrects for printers that scale the page (the usual cause of an over-sized reading).</p>
               <div className="field"><label>Camera standoff (mm)</label>
                 <input type="number" value={standoff} min={60} step={10} onChange={e=>setStandoff(parseFloat(e.target.value)||250)}/></div>
               <div className="field"><label>Correct for conductor sitting above paper</label>
