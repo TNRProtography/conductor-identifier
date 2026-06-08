@@ -72,6 +72,8 @@ export function detectConductor(shot, markers){
   const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
   const med=a=>{ const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
   const Y0=22, STEP=0.06, GAP=Math.round(1.4/STEP), SM=Math.max(1,Math.round(0.05/STEP));
+  const WT=Math.max(2,Math.round(0.28/STEP));   // texture window (~0.28 mm)
+  const KG=Math.max(1,Math.round(0.10/STEP));   // gradient span for edge snap
   const ys=[]; for(let y=Y0;y>=-Y0;y-=STEP) ys.push(y);
   const N=ys.length;
   const widths=[], topPts=[], botPts=[]; let rs=0,gs=0,bs=0,ns=0;
@@ -80,22 +82,29 @@ export function detectConductor(shot, markers){
     const L=new Float32Array(N), R=new Float32Array(N), G=new Float32Array(N), B=new Float32Array(N), ok=new Uint8Array(N);
     for(let i=0;i<N;i++){ const p=toImg(x,ys[i]), c=px(p.x,p.y);
       if(!c){ ok[i]=0; continue; } ok[i]=1; R[i]=c[0]; G[i]=c[1]; B[i]=c[2]; L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2]; }
-    // light smoothing of luminance
     const Ls=new Float32Array(N);
     for(let i=0;i<N;i++){ let s=0,n=0; for(let j=-SM;j<=SM;j++){ const t=i+j; if(t>=0&&t<N&&ok[t]){s+=L[t];n++;} } Ls[i]=n?s/n:NaN; }
-    // paper reference (luminance + colour) from the outer region |y|>16
-    const oL=[],oR=[],oG=[],oB=[];
-    for(let i=0;i<N;i++) if(ok[i] && Math.abs(ys[i])>16){ oL.push(Ls[i]); oR.push(R[i]); oG.push(G[i]); oB.push(B[i]); }
+    // local TEXTURE (std of luminance) — conductors are textured; paper & shadows are smooth
+    const tex=new Float32Array(N);
+    for(let i=0;i<N;i++){ if(!ok[i]){tex[i]=0;continue;} let s=0,s2=0,n=0;
+      for(let j=-WT;j<=WT;j++){ const t=i+j; if(t>=0&&t<N&&ok[t]){ s+=L[t]; s2+=L[t]*L[t]; n++; } }
+      tex[i]= n? Math.sqrt(Math.max(0, s2/n-(s/n)*(s/n))) : 0; }
+    // paper reference (luminance + colour + texture) from the outer region |y|>16
+    const oL=[],oR=[],oG=[],oB=[],oT=[];
+    for(let i=0;i<N;i++) if(ok[i] && Math.abs(ys[i])>16){ oL.push(Ls[i]); oR.push(R[i]); oG.push(G[i]); oB.push(B[i]); oT.push(tex[i]); }
     if(oL.length<12) continue;
-    const Lp=med(oL), Rp=med(oR), Gp=med(oG), Bp=med(oB);
+    const Lp=med(oL), Rp=med(oR), Gp=med(oG), Bp=med(oB), Tp=med(oT);
     let v=0; for(const l of oL) v+=(l-Lp)*(l-Lp); const sigma=Math.sqrt(v/oL.length);
-    const Tlum=Math.max(9, 2.6*sigma);       // TWO-SIDED luminance deviation (darker OR brighter)
-    const Tcol=Math.max(26, 3.2*sigma);      // colour distance from paper (L1)
+    const Tlum=Math.max(9, 2.6*sigma);
+    const Ttex=Math.max(6, Tp*3+2.5);            // texture must clearly exceed the paper's
+    const sP=(Rp+Gp+Bp)||1, rp=Rp/sP, gp=Gp/sP;  // paper chromaticity (brightness-independent)
+    const chroma=i=>{ const s=(R[i]+G[i]+B[i])||1; return (Math.abs(R[i]/s-rp)+Math.abs(G[i]/s-gp))*510; };
+    const Tchr=24;                               // hue/chroma shift (copper etc.) — NOT triggered by neutral shadow
+    // A sample is conductor if it is TEXTURED, specular-bright, or genuinely off-hue (e.g. copper).
+    // Being merely darker than the paper is what a SHADOW looks like, so that alone never qualifies.
     const isObj=i=>{ if(!ok[i]||isNaN(Ls[i])) return false;
-      const dl=Math.abs(Ls[i]-Lp);
-      const dc=Math.abs(R[i]-Rp)+Math.abs(G[i]-Gp)+Math.abs(B[i]-Bp);
-      return dl>Tlum || dc>Tcol; };
-    // longest object run anywhere in the band, bridging small bright gaps (specular)
+      return tex[i]>Ttex || Ls[i]>Lp+1.4*Tlum || chroma(i)>Tchr; };
+    // longest run, bridging small smooth gaps inside the conductor
     let bestLo=-1,bestHi=-1,bestLen=-1, i=0;
     while(i<N){
       if(isObj(i)){ let lo=i,hi=i,gap=0,j=i+1;
@@ -103,8 +112,13 @@ export function detectConductor(shot, markers){
         if(hi-lo>bestLen){ bestLen=hi-lo; bestLo=lo; bestHi=hi; } i=hi+1; }
       else i++; }
     if(bestLo<0) continue;
-    const yTop=(bestLo>0)?(ys[bestLo]+ys[bestLo-1])/2:ys[bestLo];
-    const yBot=(bestHi<N-1)?(ys[bestHi]+ys[bestHi+1])/2:ys[bestHi];
+    // snap each boundary to the nearest sharp luminance edge (true metal/paper transition),
+    // searching only just inside/outside the run so internal strand edges are ignored.
+    const grad=k=>{ const a=(k-KG>=0)?Ls[k-KG]:Ls[k], b=(k+KG<N)?Ls[k+KG]:Ls[k]; return Math.abs(b-a); };
+    const snap=(idx,dir)=>{ let best=idx,bg=-1; for(let d=-WT;d<=WT;d++){ const k=idx+d; if(k<1||k>=N-1||!ok[k]) continue;
+      const gk=grad(k); if(gk>bg){ bg=gk; best=k; } } return best; };
+    bestLo=snap(bestLo,-1); bestHi=snap(bestHi,1);
+    const yTop=ys[bestLo], yBot=ys[bestHi];
     const w=yTop-yBot, cen=(yTop+yBot)/2;
     if(w>0.8 && w<24 && Math.abs(cen)<16){
       widths.push(w); topPts.push({x,y:yTop}); botPts.push({x,y:yBot});
