@@ -153,6 +153,73 @@ export function materialFromEdges(shot, edges){
   return { material:(sat>0.16 && hue>=2 && hue<=55)?"Copper":"Aluminium", hue, sat };
 }
 
+/* ---- strand counting from a cross-section (end-on) photo ---- */
+export function countStrands(canvas, cx, cy, cropRadius){
+  // cx,cy = centre of conductor end (image px), cropRadius in px
+  const ctx=canvas.getContext("2d");
+  const r=Math.round(cropRadius), d=r*2;
+  const x0=Math.max(0,Math.round(cx)-r), y0=Math.max(0,Math.round(cy)-r);
+  const w=Math.min(d, canvas.width-x0), h=Math.min(d, canvas.height-y0);
+  if(w<20||h<20) return null;
+  const id=ctx.getImageData(x0,y0,w,h).data;
+  // grayscale
+  const gray=new Uint8Array(w*h); const hist=new Array(256).fill(0);
+  for(let i=0;i<w*h;i++){ const g=(id[i*4]*0.299+id[i*4+1]*0.587+id[i*4+2]*0.114)|0; gray[i]=g; hist[g]++; }
+  // Otsu threshold (strands are bright, gaps are dark)
+  let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
+  let sB=0,wB=0,wF=0,mx=0,th=128,tot=w*h;
+  for(let i=0;i<256;i++){ wB+=hist[i]; if(!wB)continue; wF=tot-wB; if(!wF)break;
+    sB+=i*hist[i]; const mB=sB/wB,mF=(sum-sB)/wF,v=wB*wF*(mB-mF)*(mB-mF); if(v>mx){mx=v;th=i;} }
+  // binary mask: bright = strand
+  const mask=new Uint8Array(w*h);
+  for(let i=0;i<w*h;i++) mask[i]=gray[i]>=th?1:0;
+  // clip to a circular region (the conductor cross-section)
+  const cxL=w/2, cyL=h/2, rr=Math.min(w,h)/2*0.92;
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    if(Math.hypot(x-cxL,y-cyL)>rr) mask[y*w+x]=0; }
+  // connected components (4-connected)
+  const lab=new Int32Array(w*h); let next=1; const blobs=[]; const stack=[];
+  for(let i=0;i<w*h;i++){
+    if(mask[i] && !lab[i]){ const id2=next++; let area=0,sx=0,sy=0,mnx=w,mxx=0,mny=h,mxy=0;
+      stack.push(i); lab[i]=id2;
+      while(stack.length){ const p=stack.pop(), px=p%w, py=(p/w)|0;
+        area++; sx+=px; sy+=py; if(px<mnx)mnx=px; if(px>mxx)mxx=px; if(py<mny)mny=py; if(py>mxy)mxy=py;
+        for(const q of [p-1,p+1,p-w,p+w]){ if(q<0||q>=w*h)continue; if(Math.abs((q%w)-px)>1)continue;
+          if(mask[q]&&!lab[q]){ lab[q]=id2; stack.push(q); } } }
+      const bw=mxx-mnx+1, bh=mxy-mny+1;
+      blobs.push({area, cx:sx/area+x0, cy:sy/area+y0, w:bw, h:bh, fill:area/(bw*bh),
+        ar:Math.min(bw,bh)/Math.max(bw,bh)}); }
+  }
+  // filter: strand-sized, roughly circular blobs
+  const totalArea=Math.PI*rr*rr; // area of the conductor cross-section
+  const minA=totalArea*0.015, maxA=totalArea*0.35;
+  const strands=blobs.filter(b=>b.area>minA && b.area<maxA && b.fill>0.55 && b.ar>0.45);
+  if(strands.length<2) return null;
+  // identify steel core: the strand closest to the overall centre that's darker than average
+  let avgBright=0; strands.forEach(b=>{ let s=0,n=0;
+    for(let dy=-3;dy<=3;dy++) for(let dx=-3;dx<=3;dx++){
+      const ix=Math.round(b.cx-x0+dx), iy=Math.round(b.cy-y0+dy);
+      if(ix>=0&&iy>=0&&ix<w&&iy<h){ s+=gray[iy*w+ix]; n++; } }
+    b.bright=n?s/n:128; avgBright+=b.bright; });
+  avgBright/=strands.length;
+  strands.sort((a,b)=>Math.hypot(a.cx-cx,a.cy-cy)-Math.hypot(b.cx-cx,b.cy-cy));
+  const center=strands[0];
+  const hasSteel = center.bright < avgBright*0.88;   // centre strand noticeably darker = steel
+  const strandCount=strands.length;
+  // standard patterns: 7=6/1, 19=12/6/1, 37=18/12/6/1
+  let construction=strandCount+"wire";
+  if(hasSteel){
+    if(strandCount<=8) construction="6/1 ACSR";
+    else if(strandCount<=20) construction="18/1 or 12/7 ACSR";
+    else construction=strandCount+"wire ACSR";
+  } else {
+    if(strandCount<=8) construction="7-wire AAC/Cu";
+    else if(strandCount<=20) construction="19-wire";
+    else construction=strandCount+"-wire";
+  }
+  return { count:strandCount, hasSteel, construction, strands:strands.map(s=>({x:s.cx,y:s.cy,area:s.area})) };
+}
+
 /* ---- overlay drawing ---- */
 function roundRect(x,X,Y,W,H,r){ x.beginPath(); x.moveTo(X+r,Y); x.arcTo(X+W,Y,X+W,Y+H,r);
   x.arcTo(X+W,Y+H,X,Y+H,r); x.arcTo(X,Y+H,X,Y,r); x.arcTo(X,Y,X+W,Y,r); x.closePath(); }

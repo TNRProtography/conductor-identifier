@@ -1,21 +1,40 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { TABLE } from './lib/conductors.js'
+import { applyVerified, confirmMeasurement, loadVerified } from './lib/learning.js'
 import {
   CARD, MARKER_PROMPTS, homography, applyH,
-  autoMarkers, detectConductor, materialFromEdges, drawOverlay
+  autoMarkers, detectConductor, materialFromEdges, drawOverlay, countStrands
 } from './lib/vision.js'
 
 const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
   return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()) }
 
-function computeMatch(dia, material, det){
-  const cands = TABLE.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
-    .sort((a,b)=>a.err-b.err)
-  const best=cands[0], margin = cands[1] ? (cands[1].err-best.err) : 99
-  let conf='low', label='Low'
+function computeMatch(dia, material, det, strandInfo){
+  // Enhance table with any verified (learned) diameters
+  const enhanced = applyVerified(TABLE)
+  let cands = enhanced.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
+  // If strand count known, filter to matching constructions
+  if(strandInfo && strandInfo.count){
+    const sc=strandInfo.count; const hasS=strandInfo.hasSteel;
+    const strandMatch = cands.filter(c=>{
+      // 6/1 ACSR = 7 strands with steel; 7-wire Cu/AAC = 7 no steel; 19-wire = 19; 37-wire = 37
+      const code=c.cons||''; const n=parseInt(code); const type=c.type||'';
+      if(sc<=8 && hasS && type==='ACSR') return true;
+      if(sc<=8 && !hasS && type!=='ACSR') return true;
+      if(sc>=17 && sc<=20) return code.startsWith('19') || type==='AAAC' || type==='AAC';
+      if(sc>=35 && sc<=39) return code.startsWith('37');
+      return true; // uncertain count → don't filter
+    });
+    if(strandMatch.length>0) cands=strandMatch;
+  }
+  cands.sort((a,b)=>a.err-b.err);
+  const best=cands[0], margin = cands[1] ? (cands[1].err-best.err) : 99;
+  let conf='low', label='Low';
   if(best.err<0.30 && margin>0.7){ conf='good'; label='High' }
   else if(best.err<0.6 && margin>0.35){ conf='med'; label='Medium' }
-  const src = (det && det.topPts) ? `Measured automatically across ${det.nScans} scan lines.` : 'Measured from your two edge taps.'
+  // Boost confidence if verified
+  if(best.verified && best.err<0.25){ conf='good'; label='High (verified)' }
+  const src = (det && det.topPts) ? `Measured across ${det.nScans} scan lines.` : 'Measured from edge taps.'
   return { dia, best, cands:cands.slice(0,4), conf, label, margin, src, material }
 }
 
@@ -26,6 +45,8 @@ export default function App(){
   const [edges,setEdges]     = useState([])
   const [material,setMaterial] = useState(null)
   const [result,setResult]   = useState(null)
+  const [strandInfo,setStrandInfo] = useState(null)   // from end-on strand counting
+  const [strandMode,setStrandMode] = useState(false) // true = next capture is for strand counting
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -151,9 +172,9 @@ export default function App(){
     detRef.current=det; diaRef.current=dia
     const mat=det.matHint||material||'Aluminium'
     setMaterial(mat)
-    setResult(computeMatch(dia,mat,det))
+    setResult(computeMatch(dia,mat,det,strandInfo))
     setScreen('result')
-  },[parallax,standoff,calBar,material])
+  },[parallax,standoff,calBar,material,strandInfo])
 
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
@@ -186,7 +207,12 @@ export default function App(){
     setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setResult(null)
     setScreen('measure')
     savePhoto(shot,'conductor')
-    setTimeout(tryFullAuto,60)
+    if(strandMode){
+      // strand counting mode: user taps the centre of the conductor cross-section
+      setInstr({text:'Tap the CENTRE of the conductor cross-section. The app will count the strands.', warn:false})
+    } else {
+      setTimeout(tryFullAuto,60)
+    }
   },[savePhoto,tryFullAuto])
 
   /* ---------- measure-screen taps & drawing ---------- */
@@ -196,10 +222,25 @@ export default function App(){
     const r=cv.getBoundingClientRect()
     const x=(ev.clientX-r.left)*(shot.width/r.width)
     const y=(ev.clientY-r.top)*(shot.height/r.height)
-    if(phase==='markers'){ if(markers.length<4) setMarkers([...markers,{x,y}]) }
-    else { if(edges.length<2){ const ne=[...edges,{x,y}]; setEdges(ne)
-      if(ne.length===2){ const m=materialFromEdges(shot,ne); setMaterial(m.material) } } }
-  },[phase,markers,edges])
+    if(strandMode){
+      // strand counting: run counter at the tapped centre
+      const cropR=Math.min(shot.width,shot.height)*0.25; // crop ~quarter of shorter dim
+      const si=countStrands(shot, x, y, cropR);
+      setStrandMode(false);
+      if(si){ setStrandInfo(si); showToast(si.count+' strands detected → '+si.construction);
+        // re-compute match with strand info, return to result
+        if(diaRef.current>0) setResult(computeMatch(diaRef.current, material||'Aluminium', detRef.current, si));
+        setScreen('result'); }
+      else { showToast("Couldn't count strands — try a clearer close-up of the cut end"); setScreen('result'); }
+      return;
+    }
+    if(phase==='markers'){
+      if(markers.length<4) setMarkers([...markers,{x,y}])
+    } else {
+      if(edges.length<2){ const ne=[...edges,{x,y}]; setEdges(ne)
+        if(ne.length===2){ const m=materialFromEdges(shot,ne); setMaterial(m.material) } }
+    }
+  },[phase,markers,edges,strandMode,material,showToast])
 
   // draw shot + dots whenever measure state changes
   useEffect(()=>{
@@ -230,7 +271,7 @@ export default function App(){
       const H=homography(markers,CARD), a=applyH(H,edges[0]), b=applyH(H,edges[1])
       finalize({ dia:Math.hypot(a.x-b.x,a.y-b.y), matHint:material, calA:edges[0], calB:edges[1], topPts:null }) } }
   }
-  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current)) }
+  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current,strandInfo)) }
   const saveResult = ()=>{
     const shot=shotRef.current; const c=document.createElement('canvas'); c.width=shot.width; c.height=shot.height
     const banner = result ? `${result.best.name==='\u2014'?result.best.cons:result.best.name}  \u00b7  ${result.best.type}  \u00b7  ${result.best.csa} mm\u00b2  \u00b7  ${result.label} confidence` : ''
@@ -384,6 +425,53 @@ export default function App(){
                : result.conf==='med' ? `Neighbouring size is close (Δ ${result.margin.toFixed(2)} mm). Re-shoot squarer / with more zoom, or confirm with calipers.`
                : 'Low confidence — sits between sizes or detection was noisy. Re-shoot flatter with flash on, and verify with calipers.'}
               {result.best.est && <> <b>This conductor’s reference Ø is estimated from CSA</b> — confirm against the datasheet.</>}
+            </div>
+            {/* ---- CONFIRM / CORRECT identification (learns for future matches) ---- */}
+            <div className="card">
+              <h2>Confirm identification</h2>
+              <p>Confirming builds a verified diameter database from your real conductors — future matches get more accurate.</p>
+              <button className="btn" style={{marginBottom:10}} onClick={()=>{
+                const nm=result.best.name==='—'?result.best.cons:result.best.name
+                confirmMeasurement(nm, result.dia)
+                showToast('Confirmed! '+nm+' diameter stored for future matches.') }}>
+                ✓ This is {result.best.name==='—'?result.best.cons:result.best.name}
+              </button>
+              <p style={{fontSize:12,color:'var(--dim)'}}>Wrong? Select the correct conductor:</p>
+              <select style={{width:'100%',padding:10,borderRadius:10,background:'var(--panel2)',color:'var(--ink)',border:'1px solid var(--line)',fontFamily:'inherit',fontSize:13}}
+                onChange={e=>{ if(e.target.value){
+                  confirmMeasurement(e.target.value, result.dia);
+                  showToast('Corrected → stored under '+e.target.value);
+                  // re-match with updated verified data
+                  setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo));
+                  e.target.value=''; } }}>
+                <option value="">— select correct conductor —</option>
+                {TABLE.map(c=>{
+                  const nm=c.name==='—'?c.cons:c.name;
+                  return <option key={nm} value={nm}>{c.name==='—'?(c.type+' '+c.cons):(c.name+' · '+c.type+' · '+c.csa+'mm²')}</option>
+                })}
+              </select>
+            </div>
+            {/* ---- STRAND COUNT (narrow the match from a cut-end photo) ---- */}
+            <div className="card">
+              <h2>Count strands (optional)</h2>
+              {strandInfo ? (
+                <div className="note" style={{borderColor:'var(--accent2)'}}>
+                  Counted <b>{strandInfo.count} strands</b> → {strandInfo.construction}.
+                  {strandInfo.hasSteel && ' Steel core detected (ACSR).'}
+                  <br/><button className="btn ghost mini" style={{marginTop:8}} onClick={()=>{setStrandInfo(null);
+                    setResult(computeMatch(diaRef.current,result.material,detRef.current,null))}}>Clear strand count</button>
+                </div>
+              ) : (
+                <p>Photographing the cut end and counting strands dramatically narrows the match (6/1 → ACSR, 7-wire → AAC/Cu, 19-wire, 37-wire).</p>
+              )}
+              <button className="btn ghost" style={{marginTop:6}} onClick={async ()=>{
+                // Quick strand-count: open camera, take photo, user taps centre
+                showToast('Take a close-up of the cut end, then tap the centre of the conductor')
+                await startCamera()
+                // The capture flow will run; when the user captures, we handle strand counting
+                // by setting a flag. After capture, they tap the conductor centre on the measure screen.
+                setStrandMode(true)
+              }}>📐 {strandInfo ? 'Re-count strands' : 'Count strands (photo the cut end)'}</button>
             </div>
             <button className="btn" onClick={saveResult}>💾 Save photo with result</button>
             <div className="row">
