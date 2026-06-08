@@ -70,41 +70,59 @@ export function detectConductor(shot, markers){
   const px=(ix,iy)=>{ ix=ix|0; iy=iy|0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
     const o=(iy*imgW+ix)*4; return [img[o],img[o+1],img[o+2]]; };
   const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
-  const Y0=22, STEP=0.08, GAP=Math.round(1.2/STEP);
+  const med=a=>{ const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
+  const Y0=22, STEP=0.06, GAP=Math.round(1.4/STEP), SM=Math.max(1,Math.round(0.05/STEP));
   const ys=[]; for(let y=Y0;y>=-Y0;y-=STEP) ys.push(y);
-  const ci=ys.findIndex(v=>Math.abs(v)<STEP/1.5);
+  const N=ys.length;
   const widths=[], topPts=[], botPts=[]; let rs=0,gs=0,bs=0,ns=0;
-  for(let x=-52;x<=52;x+=3.5){
-    const lum=new Array(ys.length), col=new Array(ys.length);
-    for(let i=0;i<ys.length;i++){ const p=toImg(x,ys[i]), c=px(p.x,p.y);
-      if(!c){ lum[i]=NaN; col[i]=false; continue; }
-      const [R,G,B]=c, L=0.299*R+0.587*G+0.114*B, mx=Math.max(R,G,B), mn=Math.min(R,G,B), S=mx?(mx-mn)/mx:0;
-      let h=0,d=mx-mn; if(d>0){ if(mx===R)h=60*(((G-B)/d)%6); else if(mx===G)h=60*(((B-R)/d)+2); else h=60*(((R-G)/d)+4);} if(h<0)h+=360;
-      lum[i]=L; col[i]=(S>0.16 && h>=2 && h<=55); }
-    const outer=[]; for(let i=0;i<ys.length;i++) if(Math.abs(ys[i])>14 && !isNaN(lum[i])) outer.push(lum[i]);
-    if(outer.length<10) continue; outer.sort((a,b)=>a-b); const Lpaper=outer[outer.length>>1];
-    const isObj=i=>!isNaN(lum[i]) && (lum[i] < Lpaper*0.80 || col[i]);
-    let c0=-1; if(isObj(ci)) c0=ci; else { const span=Math.round(9/STEP);
-      for(let d=1;d<=span&&c0<0;d++){ if(isObj(ci-d))c0=ci-d; else if(isObj(ci+d))c0=ci+d; } }
-    if(c0<0) continue;
-    let lo=c0,hi=c0;
-    for(let i=c0-1,gap=0;i>=0;i--){ if(isObj(i)){lo=i;gap=0;} else if(++gap>GAP) break; }
-    for(let i=c0+1,gap=0;i<ys.length;i++){ if(isObj(i)){hi=i;gap=0;} else if(++gap>GAP) break; }
-    const yTop=(lo>0)?(ys[lo]+ys[lo-1])/2:ys[lo];
-    const yBot=(hi<ys.length-1)?(ys[hi]+ys[hi+1])/2:ys[hi];
-    const w=yTop-yBot;
-    if(w>0.9 && w<24){ widths.push(w); topPts.push({x,y:yTop}); botPts.push({x,y:yBot});
-      const m=toImg(x,(yTop+yBot)/2), c=px(m.x,m.y); if(c){ rs+=c[0];gs+=c[1];bs+=c[2];ns++; } }
+
+  for(let x=-54;x<=54;x+=3){
+    const L=new Float32Array(N), R=new Float32Array(N), G=new Float32Array(N), B=new Float32Array(N), ok=new Uint8Array(N);
+    for(let i=0;i<N;i++){ const p=toImg(x,ys[i]), c=px(p.x,p.y);
+      if(!c){ ok[i]=0; continue; } ok[i]=1; R[i]=c[0]; G[i]=c[1]; B[i]=c[2]; L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2]; }
+    // light smoothing of luminance
+    const Ls=new Float32Array(N);
+    for(let i=0;i<N;i++){ let s=0,n=0; for(let j=-SM;j<=SM;j++){ const t=i+j; if(t>=0&&t<N&&ok[t]){s+=L[t];n++;} } Ls[i]=n?s/n:NaN; }
+    // paper reference (luminance + colour) from the outer region |y|>16
+    const oL=[],oR=[],oG=[],oB=[];
+    for(let i=0;i<N;i++) if(ok[i] && Math.abs(ys[i])>16){ oL.push(Ls[i]); oR.push(R[i]); oG.push(G[i]); oB.push(B[i]); }
+    if(oL.length<12) continue;
+    const Lp=med(oL), Rp=med(oR), Gp=med(oG), Bp=med(oB);
+    let v=0; for(const l of oL) v+=(l-Lp)*(l-Lp); const sigma=Math.sqrt(v/oL.length);
+    const Tlum=Math.max(9, 2.6*sigma);       // TWO-SIDED luminance deviation (darker OR brighter)
+    const Tcol=Math.max(26, 3.2*sigma);      // colour distance from paper (L1)
+    const isObj=i=>{ if(!ok[i]||isNaN(Ls[i])) return false;
+      const dl=Math.abs(Ls[i]-Lp);
+      const dc=Math.abs(R[i]-Rp)+Math.abs(G[i]-Gp)+Math.abs(B[i]-Bp);
+      return dl>Tlum || dc>Tcol; };
+    // longest object run anywhere in the band, bridging small bright gaps (specular)
+    let bestLo=-1,bestHi=-1,bestLen=-1, i=0;
+    while(i<N){
+      if(isObj(i)){ let lo=i,hi=i,gap=0,j=i+1;
+        while(j<N){ if(isObj(j)){ hi=j; gap=0; } else if(++gap>GAP) break; j++; }
+        if(hi-lo>bestLen){ bestLen=hi-lo; bestLo=lo; bestHi=hi; } i=hi+1; }
+      else i++; }
+    if(bestLo<0) continue;
+    const yTop=(bestLo>0)?(ys[bestLo]+ys[bestLo-1])/2:ys[bestLo];
+    const yBot=(bestHi<N-1)?(ys[bestHi]+ys[bestHi+1])/2:ys[bestHi];
+    const w=yTop-yBot, cen=(yTop+yBot)/2;
+    if(w>0.8 && w<24 && Math.abs(cen)<16){
+      widths.push(w); topPts.push({x,y:yTop}); botPts.push({x,y:yBot});
+      const m=toImg(x,cen), c=px(m.x,m.y); if(c){ rs+=c[0]; gs+=c[1]; bs+=c[2]; ns++; } }
   }
-  if(widths.length<5) return null;
-  const s=[...widths].sort((a,b)=>a-b), dia=s[s.length>>1];
+  if(widths.length<4) return null;
+  // reject scan outliers, then take the median width
+  const mw=med(widths); const kw=[],kt=[],kb=[];
+  for(let i=0;i<widths.length;i++) if(Math.abs(widths[i]-mw) <= 0.3*mw+0.4){ kw.push(widths[i]); kt.push(topPts[i]); kb.push(botPts[i]); }
+  const tw=kw.length?kw:widths, tt=kw.length?kt:topPts, tb=kw.length?kb:botPts;
+  const dia=med(tw);
   let matHint="Aluminium";
-  if(ns){ const R=rs/ns,G=gs/ns,B=bs/ns, mx=Math.max(R,G,B),mn=Math.min(R,G,B),S=mx?(mx-mn)/mx:0;
-    let h=0,d=mx-mn; if(d>0){ if(mx===R)h=60*(((G-B)/d)%6); else if(mx===G)h=60*(((B-R)/d)+2); else h=60*(((R-G)/d)+4);} if(h<0)h+=360;
+  if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns, mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
+    let h=0,d=mx-mn; if(d>0){ if(mx===Rr)h=60*(((Gg-Bb)/d)%6); else if(mx===Gg)h=60*(((Bb-Rr)/d)+2); else h=60*(((Rr-Gg)/d)+4);} if(h<0)h+=360;
     if(S>0.16 && h>=2 && h<=55) matHint="Copper"; }
-  let bi=0,bd=1e9; for(let i=0;i<topPts.length;i++){ const d=Math.abs(topPts[i].x); if(d<bd){bd=d;bi=i;} }
-  const calA=toImg(topPts[bi].x,topPts[bi].y), calB=toImg(botPts[bi].x,botPts[bi].y);
-  return { dia, matHint, calA, calB, topPts, botPts, Hinv, nScans:widths.length };
+  let bi=0,bd=1e9; for(let i=0;i<tt.length;i++){ const dd=Math.abs(tt[i].x); if(dd<bd){bd=dd;bi=i;} }
+  const calA=toImg(tt[bi].x,tt[bi].y), calB=toImg(tb[bi].x,tb[bi].y);
+  return { dia, matHint, calA, calB, topPts:tt, botPts:tb, Hinv, nScans:tw.length };
 }
 
 /* classify material from two manual edge taps */

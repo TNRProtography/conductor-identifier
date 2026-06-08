@@ -60,17 +60,36 @@ export default function App(){
   },[])
 
   /* ---------- camera ---------- */
+  // manual toggle (single attempt)
   const tryTorch = useCallback(async (on)=>{
-    const track=trackRef.current; if(!track) return
+    const track=trackRef.current; if(!track) return false
     const caps = track.getCapabilities ? track.getCapabilities() : {}
     if(('torch' in caps) && !caps.torch){
       setTorch({capable:false,on:false})
-      setCamNote("This camera has no controllable flash. iPhone Safari can't fire it from the web; use bright light.")
-      return
+      setCamNote("This camera/browser can't control the flash (e.g. iPhone Safari). Use bright lighting.")
+      return false
     }
-    try{ await track.applyConstraints({advanced:[{torch:on}]}); setTorch({capable:true,on}); if(on) setCamNote('') }
+    try{ await track.applyConstraints({advanced:[{torch:on}]}); setTorch({capable:true,on}); if(on) setCamNote(''); return true }
     catch{ setTorch({capable:false,on:false})
-      setCamNote("Flash couldn't be turned on by this browser (common on iPhone Safari). Use bright, even light.") }
+      setCamNote("Flash didn't respond — tap ⚡ to retry, or use bright light (iPhone Safari can't fire it from the web).")
+      return false }
+  },[])
+
+  // auto-enable with retries (capabilities/torch often aren't ready immediately)
+  const enableTorch = useCallback(async ()=>{
+    const track=trackRef.current; if(!track) return
+    for(let attempt=0; attempt<4; attempt++){
+      const caps = track.getCapabilities ? track.getCapabilities() : {}
+      if(('torch' in caps) && !caps.torch){
+        setTorch({capable:false,on:false})
+        setCamNote("This camera/browser can't control the flash (e.g. iPhone Safari). Use bright lighting.")
+        return
+      }
+      try{ await track.applyConstraints({advanced:[{torch:true}]}); setTorch({capable:true,on:true}); setCamNote(''); return }
+      catch{ await new Promise(r=>setTimeout(r, 300*(attempt+1))) }
+    }
+    setTorch({capable:false,on:false})
+    setCamNote("Flash didn't respond automatically — tap the ⚡ button to try again, or use bright light.")
   },[])
 
   const populateCameras = useCallback(async ()=>{
@@ -97,10 +116,14 @@ export default function App(){
     streamRef.current=stream; trackRef.current=stream.getVideoTracks()[0]
     setScreen('camera')
     setTimeout(async ()=>{
-      if(videoRef.current){ videoRef.current.srcObject=stream; await videoRef.current.play().catch(()=>{}) }
-      populateCameras(); setTimeout(()=>tryTorch(true),350)
+      const v=videoRef.current; if(!v) return
+      v.srcObject=stream
+      v.onplaying = ()=>{ enableTorch() }    // fire flash once frames are actually flowing
+      await v.play().catch(()=>{})
+      populateCameras()
+      setTimeout(enableTorch, 500)            // fallback if 'playing' didn't fire
     },30)
-  },[populateCameras,tryTorch])
+  },[populateCameras,enableTorch])
 
   /* ---------- saving ---------- */
   const savePhoto = useCallback((canvas, prefix)=>{
