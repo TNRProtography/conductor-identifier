@@ -153,6 +153,50 @@ export function materialFromEdges(shot, edges){
   return { material:(sat>0.16 && hue>=2 && hue<=55)?"Copper":"Aluminium", hue, sat };
 }
 
+/* ---- FAST live-preview detector (for AR overlay, ~10x faster) ---- */
+export function detectConductorLive(shot, markers){
+  const imgW=shot.width, imgH=shot.height;
+  const Hinv=homography(CARD, markers);
+  const ctx=shot.getContext("2d");
+  const img=ctx.getImageData(0,0,imgW,imgH).data;
+  const px=(ix,iy)=>{ ix=ix|0; iy=iy|0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
+    const o=(iy*imgW+ix)*4; return [img[o],img[o+1],img[o+2]]; };
+  const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
+  const med=a=>{ const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
+  const STEP=0.18, GAP=Math.round(1.2/STEP);
+  const ys=[]; for(let y=20;y>=-20;y-=STEP) ys.push(y); const N=ys.length;
+  const widths=[], topPts=[], botPts=[];
+  let rs=0,gs=0,bs=0,ns=0;
+  for(let x=-48;x<=48;x+=7){
+    const L=new Float32Array(N), ok=new Uint8Array(N), R=new Float32Array(N),G=new Float32Array(N),B=new Float32Array(N);
+    for(let i=0;i<N;i++){ const p=toImg(x,ys[i]),c=px(p.x,p.y);
+      if(!c){ok[i]=0;continue;} ok[i]=1; R[i]=c[0];G[i]=c[1];B[i]=c[2]; L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2]; }
+    const oL=[];for(let i=0;i<N;i++) if(ok[i]&&Math.abs(ys[i])>14) oL.push(L[i]);
+    if(oL.length<6) continue; oL.sort((a,b)=>a-b); const Lp=oL[oL.length>>1];
+    let v=0;for(const l of oL) v+=(l-Lp)*(l-Lp); const sigma=Math.sqrt(v/oL.length);
+    const T=Math.max(12,3*sigma);
+    // fast: two-sided luminance deviation only (good enough for preview)
+    const isObj=i=>ok[i] && Math.abs(L[i]-Lp)>T;
+    let bestLo=-1,bestHi=-1,bestLen=-1,i=0;
+    while(i<N){ if(isObj(i)){let lo=i,hi=i,gap=0,j=i+1;
+      while(j<N){if(isObj(j)){hi=j;gap=0;}else if(++gap>GAP)break;j++;}
+      if(hi-lo>bestLen){bestLen=hi-lo;bestLo=lo;bestHi=hi;} i=hi+1;} else i++; }
+    if(bestLo<0) continue;
+    const yT=ys[bestLo],yB=ys[bestHi],w=yT-yB,cen=(yT+yB)/2;
+    if(w>0.8&&w<24&&Math.abs(cen)<16){ widths.push(w); topPts.push({x,y:yT}); botPts.push({x,y:yB});
+      const m=toImg(x,cen),c=px(m.x,m.y); if(c){rs+=c[0];gs+=c[1];bs+=c[2];ns++;} }
+  }
+  if(widths.length<3) return null;
+  const dia=med(widths);
+  let matHint="Aluminium";
+  if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns,mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
+    let h=0,d=mx-mn; if(d>0){if(mx===Rr)h=60*(((Gg-Bb)/d)%6);else if(mx===Gg)h=60*(((Bb-Rr)/d)+2);else h=60*(((Rr-Gg)/d)+4);}if(h<0)h+=360;
+    if(S>0.16&&h>=2&&h<=55) matHint="Copper"; }
+  let bi=0,bd=1e9;for(let i=0;i<topPts.length;i++){const dd=Math.abs(topPts[i].x);if(dd<bd){bd=dd;bi=i;}}
+  const calA=toImg(topPts[bi].x,topPts[bi].y),calB=toImg(botPts[bi].x,botPts[bi].y);
+  return {dia,matHint,calA,calB,topPts,botPts,Hinv,nScans:widths.length};
+}
+
 /* ---- strand counting from a cross-section (end-on) photo ---- */
 export function countStrands(canvas, cx, cy, cropRadius){
   // cx,cy = centre of conductor end (image px), cropRadius in px

@@ -72,6 +72,7 @@ export default function App(){
   const overlayRef = useRef(null)    // AR overlay canvas (on top of video)
   const [liveMatch,setLiveMatch] = useState(null) // live AR detection result
   const liveT = useRef(0)           // throttle timestamp for live HUD updates
+  const stabilityBuf = useRef([])  // last N live diameters for stability detection
 
   if(!shotRef.current && typeof document!=='undefined') shotRef.current = document.createElement('canvas')
   if(!procRef.current && typeof document!=='undefined') procRef.current = document.createElement('canvas')
@@ -87,67 +88,67 @@ export default function App(){
   },[])
 
   /* ---------- AR LIVE OVERLAY (runs while camera is active) ---------- */
+  /* Video is hidden; each frame is drawn onto the visible canvas, then detection
+     runs on the clean frame, then overlays are drawn on top. No z-index issues. */
   useEffect(()=>{
-    if(screen!=='camera') { setLiveMatch(null); return; }
+    if(screen!=='camera') { setLiveMatch(null); stabilityBuf.current=[]; return; }
     let running=true, busy=false;
-    const proc=procRef.current, ov=overlayRef.current;
-    if(!proc) return;
-    function loop(){ if(!running) return; if(!busy){ busy=true; frame().finally(()=>{busy=false;}); } requestAnimationFrame(loop); }
-    async function frame(){
-      const v=videoRef.current; if(!v||v.readyState<2||!ov) return;
-      const pw=640, ph=Math.round(640*v.videoHeight/(v.videoWidth||1));
-      proc.width=pw; proc.height=ph;
-      proc.getContext('2d').drawImage(v,0,0,pw,ph);
-      // size overlay to match video display
-      const vr=v.getBoundingClientRect(); const dpr=window.devicePixelRatio||1;
-      const ow=Math.round(vr.width*dpr), oh=Math.round(vr.height*dpr);
-      if(ov.width!==ow||ov.height!==oh){ ov.width=ow; ov.height=oh; ov.style.width=vr.width+'px'; ov.style.height=vr.height+'px'; }
-      const ox=ov.getContext('2d'); ox.clearRect(0,0,ow,oh);
-      const sx=ow/pw, sy=oh/ph;
-      // detect markers
-      let mk=null; try{mk=autoMarkers(proc);}catch{}
+    function loop(){ if(!running) return; if(!busy){ busy=true; try{frame();}catch(e){console.error('AR:',e);}finally{busy=false;} } requestAnimationFrame(loop); }
+    function frame(){
+      const v=videoRef.current, ov=overlayRef.current;
+      if(!v||v.readyState<2||!ov) return;
+      const vw=v.videoWidth, vh=v.videoHeight; if(!vw) return;
+      const pw=640, ph=Math.round(640*vh/vw);
+      if(ov.width!==pw||ov.height!==ph){ ov.width=pw; ov.height=ph; ov.style.aspectRatio=pw+'/'+ph; }
+      const ox=ov.getContext('2d');
+      // 1. draw the live video frame (clean)
+      ox.drawImage(v,0,0,pw,ph);
+      // 2. detect markers (autoMarkers copies to its own temp canvas internally)
+      let mk=null; try{mk=autoMarkers(ov);}catch{}
+      // 3. detect conductor if markers found (reads clean pixels before overlays)
+      let det=null;
+      if(mk&&mk.length===4){ try{det=detectConductorLive(ov,mk);}catch{} }
+      // 4. draw overlays on top
       if(mk&&mk.length===4){
-        // draw marker circles + card outline
-        ox.strokeStyle='#19d3a2'; ox.lineWidth=2.5*dpr;
-        mk.forEach(m=>{ ox.beginPath(); ox.arc(m.x*sx,m.y*sy,10*dpr,0,7); ox.stroke(); });
-        ox.beginPath(); mk.forEach((m,i)=>i?ox.lineTo(m.x*sx,m.y*sy):ox.moveTo(m.x*sx,m.y*sy));
-        ox.closePath(); ox.strokeStyle='rgba(25,211,162,0.35)'; ox.lineWidth=1.5*dpr; ox.setLineDash([6*dpr,4*dpr]); ox.stroke(); ox.setLineDash([]);
-        // detect conductor (fast)
-        let det=null; try{det=detectConductorLive(proc,mk);}catch{}
+        ox.strokeStyle='#19d3a2'; ox.lineWidth=2;
+        mk.forEach(m=>{ ox.beginPath(); ox.arc(m.x,m.y,8,0,7); ox.stroke(); });
+        ox.beginPath(); mk.forEach((m,i)=>i?ox.lineTo(m.x,m.y):ox.moveTo(m.x,m.y));
+        ox.closePath(); ox.strokeStyle='rgba(25,211,162,0.3)'; ox.lineWidth=1.5; ox.setLineDash([5,3]); ox.stroke(); ox.setLineDash([]);
         if(det){
-          // draw edge traces
           const Hi=det.Hinv;
-          ox.lineWidth=2*dpr; ox.lineJoin='round'; ox.strokeStyle='#e5007d';
-          [det.topPts,det.botPts].forEach(pts=>{ox.beginPath();pts.forEach((p,i)=>{const q=applyH(Hi,{x:p.x,y:p.y});i?ox.lineTo(q.x*sx,q.y*sy):ox.moveTo(q.x*sx,q.y*sy);});ox.stroke();});
-          // caliper
+          ox.lineWidth=2; ox.lineJoin='round'; ox.strokeStyle='#e5007d';
+          [det.topPts,det.botPts].forEach(pts=>{ox.beginPath();pts.forEach((p,i)=>{const q=applyH(Hi,{x:p.x,y:p.y});i?ox.lineTo(q.x,q.y):ox.moveTo(q.x,q.y);});ox.stroke();});
           const A=det.calA,B=det.calB;
-          ox.lineWidth=2.5*dpr; ox.beginPath(); ox.moveTo(A.x*sx,A.y*sy); ox.lineTo(B.x*sx,B.y*sy); ox.stroke();
-          // diameter label
-          const fs=Math.round(14*dpr), label=det.dia.toFixed(1)+' mm';
+          ox.lineWidth=2.5; ox.beginPath(); ox.moveTo(A.x,A.y); ox.lineTo(B.x,B.y); ox.stroke();
+          const fs=13, label=det.dia.toFixed(1)+' mm';
           ox.font='700 '+fs+'px monospace'; const tw=ox.measureText(label).width;
-          const tx=(A.x+B.x)/2*sx+8*dpr, ty=(A.y+B.y)/2*sy;
-          ox.fillStyle='rgba(8,11,14,0.82)'; ox.fillRect(tx-3*dpr,ty-fs*0.6,tw+6*dpr,fs*1.2);
+          const tx=(A.x+B.x)/2+6, ty=(A.y+B.y)/2;
+          ox.fillStyle='rgba(8,11,14,0.82)'; ox.fillRect(tx-3,ty-fs*0.6,tw+6,fs*1.2);
           ox.fillStyle='#fff'; ox.textBaseline='middle'; ox.fillText(label,tx,ty);
-          // throttled HUD update (every 300ms)
-          const now=Date.now();
-          if(now-liveT.current>300){
-            liveT.current=now;
-            const cb=Math.max(50,calBar||100); let dia=det.dia*(cb/100);
-            if(parallax){const s=Math.max(60,standoff||250); dia=dia*(s-dia/2)/s;}
-            const m=computeMatch(dia,det.matHint,null,strandInfo);
-            setLiveMatch({dia,name:m.best.name==='—'?m.best.cons:m.best.name,type:m.best.type,conf:m.conf,label:m.label});
-          }
-        } else { if(Date.now()-liveT.current>600) setLiveMatch(null); }
+        }
       } else {
-        // no markers: guidance
-        ox.font=`600 ${Math.round(14*dpr)}px sans-serif`; ox.fillStyle='rgba(25,211,162,0.85)'; ox.textAlign='center';
-        ox.fillText('Point at the marker card',ow/2,oh-30*dpr);
-        if(Date.now()-liveT.current>600) setLiveMatch(null);
+        ox.font='600 14px sans-serif'; ox.fillStyle='rgba(25,211,162,0.85)'; ox.textAlign='center';
+        ox.fillText('Point at the marker card',pw/2,ph-20); ox.textAlign='start';
       }
+      // 5. throttled HUD + stability
+      const now=Date.now();
+      if(now-liveT.current<250) return;
+      liveT.current=now;
+      if(det){
+        const cb=Math.max(50,calBar||100); let dia=det.dia*(cb/100);
+        if(parallax){const s=Math.max(60,standoff||250); dia=dia*(s-dia/2)/s;}
+        const buf=stabilityBuf.current; buf.push(dia); if(buf.length>8) buf.shift();
+        let stable=false;
+        if(buf.length>=5){ const avg=buf.reduce((a,b)=>a+b)/buf.length;
+          const std=Math.sqrt(buf.reduce((a,b)=>a+(b-avg)**2,0)/buf.length); stable=std<0.18; }
+        if(stable && !(liveMatch&&liveMatch.stable)) try{navigator.vibrate?.(30);}catch{}
+        const m=computeMatch(dia,det.matHint,null,strandInfo);
+        setLiveMatch({dia,name:m.best.name==='\u2014'?m.best.cons:m.best.name,type:m.best.type,conf:m.conf,label:m.label,stable});
+      } else { stabilityBuf.current=[]; setLiveMatch(null); }
     }
-    const tid=setTimeout(loop,400);
+    const tid=setTimeout(loop,300);
     return ()=>{ running=false; clearTimeout(tid); };
-  },[screen,calBar,parallax,standoff,strandInfo])
+  },[screen,calBar,parallax,standoff,strandInfo,liveMatch])
 
   /* ---------- camera ---------- */
   // manual toggle (single attempt)
@@ -181,6 +182,21 @@ export default function App(){
     setTorch({capable:false,on:false})
     setCamNote("Flash didn't respond automatically — tap the ⚡ button to try again, or use bright light.")
   },[])
+
+  // tap to focus
+  const doFocus = useCallback(async ()=>{
+    const track=trackRef.current; if(!track) return
+    try{
+      const caps=track.getCapabilities?track.getCapabilities():{};
+      if(caps.focusMode && caps.focusMode.includes('single-shot')){
+        await track.applyConstraints({focusMode:'single-shot'});
+        showToast('Focusing...');
+      } else if(caps.focusMode && caps.focusMode.includes('manual')){
+        await track.applyConstraints({focusMode:'continuous'});
+        showToast('Refocusing...');
+      } else { showToast('Focus control not available in this browser'); }
+    } catch{ showToast('Focus control not available'); }
+  },[showToast])
 
   const populateCameras = useCallback(async ()=>{
     try{
@@ -385,22 +401,27 @@ export default function App(){
 
         {screen==='camera' && (
           <>
+            {/* Video is hidden — frames drawn to the AR canvas instead, so overlays align perfectly */}
+            <video ref={videoRef} playsInline autoPlay muted style={{position:'absolute',width:1,height:1,opacity:0,pointerEvents:'none'}}/>
             <div className="stage" style={{position:'relative'}}>
-              <video ref={videoRef} playsInline autoPlay muted/>
-              <canvas ref={overlayRef} style={{position:'absolute',top:0,left:0,width:'100%',height:'100%',pointerEvents:'none'}}/>
-              <button className={'flashbtn'+(torch.on?' on':'')} onClick={()=>tryTorch(!torch.on)}>
+              <canvas ref={overlayRef} style={{display:'block',width:'100%'}}/>
+              <button className={'flashbtn'+(torch.on?' on':'')} onClick={()=>tryTorch(!torch.on)} style={{zIndex:3}}>
                 <span>⚡</span><span>{torch.on?'Flash ON':'Flash'}</span>
               </button>
+              <button className="flashbtn" onClick={doFocus} style={{left:10,right:'auto',zIndex:3}}>
+                <span>🔍</span><span>Focus</span>
+              </button>
               {liveMatch ? (
-                <div className="hud" style={{textAlign:'center'}}>
+                <div className="hud" style={{textAlign:'center',zIndex:2}}>
                   <b style={{fontSize:18,color:'#e5007d'}}>{liveMatch.dia.toFixed(1)} mm</b>
                   <span style={{margin:'0 8px',color:'#19d3a2'}}>&rarr;</span>
                   <b style={{color:'#19d3a2'}}>{liveMatch.name}</b>
                   <span style={{marginLeft:6,fontSize:10,opacity:0.7}}>{liveMatch.type}</span>
                   <span className={'pill '+(liveMatch.conf)} style={{marginLeft:8,fontSize:9,padding:'3px 7px'}}>{liveMatch.label}</span>
+                  {liveMatch.stable && <span className="pill good" style={{marginLeft:6,fontSize:9,padding:'3px 7px'}}>STABLE ✓</span>}
                 </div>
               ) : (
-                <div className="hud">Fit the <b>whole card</b> in frame &middot; conductor in the clear channel</div>
+                <div className="hud" style={{zIndex:2}}>Fit the <b>whole card</b> in frame &middot; conductor in the clear channel</div>
               )}
             </div>
             <div className="cambar">
