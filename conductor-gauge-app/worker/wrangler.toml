@@ -1,0 +1,8 @@
+# CLI deploys only — ignore this file if deploying via the Cloudflare dashboard.
+name = "conductor-gauge-api"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+kv_namespaces = [
+  { binding = "KV", id = "PASTE_KV_NAMESPACE_ID_HERE" }
+]

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { TABLE } from './lib/conductors.js'
-import { applyVerified, confirmMeasurement, loadVerified } from './lib/learning.js'
+import { applyVerified, confirmConductor, syncVerified, shotToJpeg } from './lib/learning.js'
 import {
   CARD, MARKER_PROMPTS, homography, applyH,
   autoMarkers, detectConductor, detectConductorLive, materialFromEdges, drawOverlay, countStrands, analyzeWinding
@@ -160,6 +160,23 @@ export default function App(){
     window.addEventListener('beforeinstallprompt',h)
     return ()=>window.removeEventListener('beforeinstallprompt',h)
   },[])
+
+
+  const collectFeatures = useCallback(()=>{
+    const d=detRef.current||{}
+    return {
+      layer:d.layer||null, ridge:d.ridge||null,
+      strandW:d.winding?d.winding.strandW:null,
+      nOuter:d.winding?d.winding.nOuter:null,
+      layPeriod:d.layPeriod||null, tilt:d.tilt!=null?+d.tilt.toFixed(2):null,
+      bow:d.bow!=null?+d.bow.toFixed(2):null,
+      material:material||null, stiffness:stiffness||null,
+      manualStrands:manualStrands||null, covered:!!covered,
+    }
+  },[material,stiffness,manualStrands,covered])
+
+  /* ---------- shared verified library: pull on launch ---------- */
+  useEffect(()=>{ syncVerified() },[])
 
   /* ---------- AR LIVE OVERLAY (runs while camera is active) ---------- */
   /* Video is hidden; each frame is drawn onto the visible canvas, then detection
@@ -863,6 +880,7 @@ export default function App(){
                 <span className="matchname">{result.best.name==='—'?result.best.cons:result.best.name}</span>
                 <span className={'pill '+result.conf}>{result.label} confidence</span>
                 {result.best.est && <span className="pill med" style={{fontSize:9}}>Ø estimated</span>}
+                {result.best.community && <span className="pill good" style={{fontSize:9}}>team-verified ×{result.best.verifiedCount}</span>}
               </div>
               {result.best.desc && (
                 <div className="note" style={{marginBottom:14,borderColor:'var(--accent2)',background:'rgba(5,196,137,.07)'}}>
@@ -952,15 +970,15 @@ export default function App(){
               <p>Confirming builds a verified diameter database from your real conductors — future matches get more accurate.</p>
               <button className="btn" style={{marginBottom:10}} onClick={()=>{
                 const nm=result.best.name==='—'?result.best.cons:result.best.name
-                confirmMeasurement(nm, result.dia)
-                showToast('Confirmed! '+nm+' diameter stored for future matches.') }}>
+                const r=confirmConductor(nm, result.dia, collectFeatures(), shotToJpeg(shotRef.current))
+                showToast(r.queued?'Confirmed! '+nm+' shared to the team library.':'Confirmed! '+nm+' stored on this device.') }}>
                 ✓ This is {result.best.name==='—'?result.best.cons:result.best.name}
               </button>
               <p style={{fontSize:12,color:'var(--dim)'}}>Wrong? Select the correct conductor:</p>
               <select className="confirm-select"
                 onChange={e=>{ if(e.target.value){
-                  confirmMeasurement(e.target.value, result.dia);
-                  showToast('Corrected → stored under '+e.target.value);
+                  const r=confirmConductor(e.target.value, result.dia, collectFeatures(), shotToJpeg(shotRef.current));
+                  showToast(r.queued?'Corrected → shared to the team library as '+e.target.value:'Corrected → stored under '+e.target.value);
                   // re-match with updated verified data
                   setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,manualStrands,stiffness));
                   e.target.value=''; } }}>
