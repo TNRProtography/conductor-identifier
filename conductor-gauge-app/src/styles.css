@@ -175,3 +175,17 @@ footer .brand-foot{color:var(--accent2); font-weight:700; font-family:"Poppins",
 
 /* Divider line */
 .divider{height:1px; background:var(--line); border:none; margin:4px 0;}
+
+/* Stiffness picker */
+.stiff-picker{display:flex; flex-direction:column; gap:8px;}
+.stiff-btn{display:flex; align-items:flex-start; gap:14px; padding:14px 16px; border-radius:14px;
+  background:var(--panel2); border:1.5px solid var(--line); text-align:left; width:100%;
+  cursor:pointer; transition:border-color .15s, background .15s;}
+.stiff-btn.active{background:rgba(43,100,100,.35); border-color:var(--accent2);}
+.stiff-btn .stiff-icon{font-size:22px; line-height:1; flex:none; width:28px; text-align:center;
+  color:var(--accent2); margin-top:1px;}
+.stiff-btn .stiff-title{font-family:"Poppins",sans-serif; font-size:14px; font-weight:700;
+  color:var(--ink); display:block; margin-bottom:3px;}
+.stiff-btn .stiff-hint{font-size:12px; color:var(--dim); line-height:1.45; display:block;}
+.stiff-btn:last-child .stiff-icon{color:var(--accent);}
+.stiff-btn .stiff-text{display:flex; flex-direction:column;}

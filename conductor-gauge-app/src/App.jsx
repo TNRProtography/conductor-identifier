@@ -9,10 +9,10 @@ import {
 const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
   return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()) }
 
-function computeMatch(dia, material, det, strandInfo, manualStrands){
+function computeMatch(dia, material, det, strandInfo, manualStrands, stiffness){
   const enhanced = applyVerified(TABLE)
   let cands = enhanced.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
-  // Strand filter: manual entry takes priority over auto-detected
+  // Strand filter
   const sc = manualStrands || (strandInfo && strandInfo.count && String(strandInfo.count))
   const hasSt = manualStrands==='6/1' || (strandInfo && strandInfo.hasSteel && !manualStrands)
   if(sc){
@@ -25,6 +25,11 @@ function computeMatch(dia, material, det, strandInfo, manualStrands){
       return true
     })
     if(f.length>0) cands=f
+  }
+  // Stiffness filter
+  if(stiffness){
+    const sf=cands.filter(c=>c.stiffness===stiffness)
+    if(sf.length>0) cands=sf
   }
   cands.sort((a,b)=>a.err-b.err)
   const best=cands[0], margin=cands[1]?(cands[1].err-best.err):99
@@ -47,6 +52,7 @@ export default function App(){
   const [strandInfo,setStrandInfo] = useState(null)   // from end-on strand counting
   const [strandMode,setStrandMode] = useState(false)  // true = next capture is for strand counting
   const [manualStrands,setManualStrands] = useState(null) // user-selected strand count override
+  const [stiffness,setStiffness] = useState(null)        // 'flexible' | 'medium' | 'stiff'
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -142,7 +148,7 @@ export default function App(){
         if(buf.length>=5){ const avg=buf.reduce((a,b)=>a+b)/buf.length;
           const std=Math.sqrt(buf.reduce((a,b)=>a+(b-avg)**2,0)/buf.length); stable=std<0.18; }
         if(stable && !(liveMatch&&liveMatch.stable)) try{navigator.vibrate?.(30);}catch{}
-        const m=computeMatch(dia,det.matHint,null,strandInfo,manualStrands);
+        const m=computeMatch(dia,det.matHint,null,strandInfo,manualStrands,stiffness);
         setLiveMatch({dia,name:m.best.name==='\u2014'?m.best.cons:m.best.name,type:m.best.type,conf:m.conf,label:m.label,stable});
       } else { stabilityBuf.current=[]; setLiveMatch(null); }
     }
@@ -256,9 +262,9 @@ export default function App(){
     detRef.current=det; diaRef.current=dia
     const mat=det.matHint||material||'Aluminium'
     setMaterial(mat)
-    setResult(computeMatch(dia,mat,det,strandInfo,manualStrands))
+    setResult(computeMatch(dia,mat,det,strandInfo,manualStrands,stiffness))
     setScreen('result')
-  },[parallax,standoff,calBar,material,strandInfo,manualStrands])
+  },[parallax,standoff,calBar,material,strandInfo,manualStrands,stiffness])
 
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
@@ -355,7 +361,7 @@ export default function App(){
       const H=homography(markers,CARD), a=applyH(H,edges[0]), b=applyH(H,edges[1])
       finalize({ dia:Math.hypot(a.x-b.x,a.y-b.y), matHint:material, calA:edges[0], calB:edges[1], topPts:null }) } }
   }
-  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current,strandInfo,manualStrands)) }
+  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current,strandInfo,manualStrands,stiffness)) }
   const saveResult = ()=>{
     const shot=shotRef.current; const c=document.createElement('canvas'); c.width=shot.width; c.height=shot.height
     const banner = result ? `${result.best.name==='\u2014'?result.best.cons:result.best.name}  \u00b7  ${result.best.type}  \u00b7  ${result.best.csa} mm\u00b2  \u00b7  ${result.label} confidence` : ''
@@ -503,32 +509,65 @@ export default function App(){
             </div>
             <div className="card">
               <h2>Best match</h2>
-              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6,flexWrap:'wrap'}}>
+              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8,flexWrap:'wrap'}}>
                 <span className="matchname">{result.best.name==='—'?result.best.cons:result.best.name}</span>
                 <span className={'pill '+result.conf}>{result.label} confidence</span>
                 {result.best.est && <span className="pill med" style={{fontSize:9}}>Ø estimated</span>}
               </div>
-              <div className="kv"><span className="label">Construction</span><span className="value">{result.best.type}{result.best.cons && result.best.cons!==result.best.name ? '  ·  '+result.best.cons : ''}</span></div>
+              {result.best.desc && (
+                <div className="note" style={{marginBottom:14,borderColor:'var(--accent2)',background:'rgba(5,196,137,.07)'}}>
+                  {result.best.desc}
+                </div>
+              )}
+              <div className="kv"><span className="label">Construction</span><span className="value">{result.best.type}{result.best.cons&&result.best.cons!==result.best.name?'  ·  '+result.best.cons:''}</span></div>
               <div className="kv"><span className="label">Material</span><span className="value"><span className={'matchip '+chip(result.best.mat)}/>{result.best.mat}</span></div>
               <div className="kv"><span className="label">Cross-sectional area</span><span className="value">{result.best.csa} mm²</span></div>
               <div className="kv"><span className="label">Nominal Ø / measured</span><span className="value">{result.best.dia.toFixed(2)}{result.best.est?' (est)':''} / {result.dia.toFixed(2)} mm</span></div>
-              <div style={{marginTop:12}}>
-                <div className="sub" style={{fontSize:10,color:'var(--dim)',letterSpacing:'.12em',textTransform:'uppercase',marginBottom:6}}>Material wrong? Override:</div>
+              <div style={{marginTop:14}}>
+                <div style={{fontSize:10,color:'var(--dim)',letterSpacing:'.12em',textTransform:'uppercase',marginBottom:6,fontFamily:'Poppins,sans-serif',fontWeight:600}}>Material wrong? Override:</div>
                 <div className="seg">
                   {['Copper','Aluminium'].map(m=>
                     <button key={m} className={result.material===m?'on':''} onClick={()=>overrideMaterial(m)}>{m}</button>)}
                 </div>
               </div>
             </div>
+
+            {/* ---- STIFFNESS FILTER ---- */}
             <div className="card">
-              <h2>Candidates (same material)</h2>
+              <h2>Stiffness</h2>
+              <p style={{marginBottom:12}}>Flex the conductor by hand. Narrows the match between AAC, AAAC, and ACSR, which can look identical.</p>
+              <div className="stiff-picker">
+                {[
+                  {v:'flexible',icon:'〰',title:'Flexible', hint:'Bends easily, droops under its weight. Typical of AAC (Namu, Kutu, Rango, Weke).'},
+                  {v:'medium',  icon:'◡',title:'Medium',   hint:'Some resistance, partially holds shape. Typical of AAAC (Chlorine, Fluorine, Helium…).'},
+                  {v:'stiff',   icon:'━',title:'Stiff',    hint:'Barely bends, stays straight. Typical of ACSR (steel core) and hard-drawn copper.'},
+                ].map(({v,icon,title,hint})=>(
+                  <button key={v} className={'stiff-btn'+(stiffness===v?' active':'')}
+                    onClick={()=>{
+                      const next=stiffness===v?null:v; setStiffness(next);
+                      setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,manualStrands,next));
+                    }}>
+                    <span className="stiff-icon">{icon}</span>
+                    <span className="stiff-text"><span className="stiff-title">{title}</span><span className="stiff-hint">{hint}</span></span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ---- CANDIDATES ---- */}
+            <div className="card">
+              <h2>All candidates{stiffness||manualStrands?' (filtered)':' (same material)'}</h2>
               {result.cands.map((c,i)=>(
                 <div key={i} className={'cand'+(i===0?' top':'')}>
-                  <span className="nm"><span className={'matchip '+chip(c.mat)}/>{c.name==='—'?(c.type+' '+c.cons):(c.name+' · '+c.type)}</span>
-                  <span className="d">Ø{c.dia.toFixed(2)}{c.est?'*':''} · Δ{c.err.toFixed(2)} mm · {c.csa}mm²</span>
+                  <div style={{flex:1}}>
+                    <div className="nm"><span className={'matchip '+chip(c.mat)}/>{c.name==='—'?(c.type+' '+c.cons):(c.name+' · '+c.type)}</div>
+                    <div className="d" style={{marginTop:2}}>Ø{c.dia.toFixed(2)}{c.est?'*':''} · Δ{c.err.toFixed(2)} mm · {c.csa} mm²</div>
+                    {c.desc && <div style={{fontSize:11.5,color:'var(--dim)',marginTop:5,lineHeight:1.45}}>{c.desc}</div>}
+                  </div>
                 </div>
               ))}
             </div>
+
             <div className={'note'+(result.conf==='good'?'':' warn')}>
               {result.src}{' '}
               {result.conf==='good' ? 'Clear match — well clear of the next size. Still worth a caliper check for safety-critical work.'
@@ -573,7 +612,7 @@ export default function App(){
                   confirmMeasurement(e.target.value, result.dia);
                   showToast('Corrected → stored under '+e.target.value);
                   // re-match with updated verified data
-                  setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,manualStrands));
+                  setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,manualStrands,stiffness));
                   e.target.value=''; } }}>
                 <option value="">— select correct conductor —</option>
                 {TABLE.map(c=>{
@@ -606,7 +645,7 @@ export default function App(){
             </div>
             <button className="btn" onClick={saveResult}>💾 Save photo with result</button>
             <div className="row">
-              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setManualStrands(null); setTimeout(tryFullAuto,40) }}>Measure again</button>
+              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setManualStrands(null); setStiffness(null); setTimeout(tryFullAuto,40) }}>Measure again</button>
               <button className="btn ghost" onClick={()=>startCamera()}>New photo</button>
             </div>
           </>
