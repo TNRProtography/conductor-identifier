@@ -363,30 +363,64 @@ export default function App(){
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
     const dets=[]
-    // main frame
-    try{ const d=detectConductor(shot,mk); if(d) dets.push({det:d,src:shot,mk}) }catch{}
-    // burst frames — markers re-found per frame (slight hand motion between frames)
+    /* trust weights: the primary frame (full-res, taken at the moment of intent)
+       counts most; normal burst frames full weight; exposure-bracketed frames
+       carry useful but systematically-biased edges, so they count less.
+       Weak detections (few scan lines) are discounted further. */
+    const addDet=(d,src,m2,baseW)=>{
+      let w=baseW
+      if(d.nScans<8) w*=0.6
+      dets.push({det:d,src,mk:m2,w,tag:src._tag||'primary'})
+    }
+    try{ const d=detectConductor(shot,mk); if(d) addDet(d,shot,mk,1.15) }catch{}
     for(const c of burstRef.current){
       try{
         const m2=autoMarkers(c)||mk
-        const d=detectConductor(c,m2); if(d) dets.push({det:d,src:c,mk:m2})
+        const d=detectConductor(c,m2)
+        if(d) addDet(d,c,m2,(c._tag==='under'||c._tag==='over')?0.75:1.0)
       }catch{}
     }
     if(!dets.length) return false
-    // median diameter wins; keep that frame's det for the overlay
-    dets.sort((a,b)=>a.det.dia-b.det.dia)
-    const pick=dets[dets.length>>1]
-    const det=pick.det
+
+    /* CONSENSUS: for every reading, gather all readings within ±0.15 mm and
+       sum their weights. The heaviest cluster wins; its weighted mean is the
+       measurement. Outliers (motion blur, exposure bias) simply lose the vote.
+       Falls back to the median only when nothing agrees. */
+    const TOL=0.15
+    let best=null
+    for(const r of dets){
+      const members=dets.filter(o=>Math.abs(o.det.dia-r.det.dia)<=TOL)
+      const score=members.reduce((s,o)=>s+o.w,0)
+      if(!best || score>best.score+1e-9) best={score,members}
+    }
+    let pick, det, method
+    if(best && best.members.length>=2){
+      const sw=best.members.reduce((s,o)=>s+o.w,0)
+      const mean=best.members.reduce((s,o)=>s+o.det.dia*o.w,0)/sw
+      best.members.sort((a,b)=>Math.abs(a.det.dia-mean)-Math.abs(b.det.dia-mean))
+      pick=best.members[0]
+      det={...pick.det, dia:mean}
+      method={kind:'consensus', n:best.members.length, used:best.members.map(o=>o.det.dia)}
+    } else {
+      dets.sort((a,b)=>a.det.dia-b.det.dia)
+      pick=dets[dets.length>>1]
+      det=pick.det
+      method={kind:'median', n:1, used:[det.dia]}
+    }
     // winding analysis on the winning frame: strand count from the helix pattern
     try{
-      const wind=analyzeWinding(pick.src, pick.mk, det)
-      if(wind){ det.winding=wind; det.layer=wind.layer }   // winding evidence beats ridge count
+      const wind=analyzeWinding(pick.src, pick.mk, pick.det)
+      if(wind){ det.winding=wind; det.layer=wind.layer }
     }catch{}
     const dias=dets.map(d=>d.det.dia)
+    const sorted=[...dias].sort((a,b)=>a-b)
     setFramesInfo({ dias, attempted:1+burstRef.current.length,
-      spread:dias.length>1 ? dias[dias.length-1]-dias[0] : 0, median:det.dia })
+      spread:sorted.length>1 ? sorted[sorted.length-1]-sorted[0] : 0,
+      median:det.dia, method })
     setSceneWarn(sceneChecks(mk, shot.width, shot.height, det))
-    showToast(dets.length>1?`Compared ${dets.length} frames — median taken`:'Conductor found & measured')
+    showToast(method.kind==='consensus'
+      ? `${method.n} frames agreed — consensus used`
+      : (dets.length>1?'Frames disagreed — median taken':'Conductor found & measured'))
     finalize(det); return true
   },[finalize,showToast])
 
@@ -442,7 +476,9 @@ export default function App(){
             }catch{}
           }
         } else {
-          const c=document.createElement('canvas'); grab(c); burstRef.current.push(c)
+          const c=document.createElement('canvas'); grab(c)
+          c._tag=(evCap && k===4)?'under':(evCap && k===5)?'over':'normal'
+          burstRef.current.push(c)
         }
         try{navigator.vibrate?.(15)}catch{}
         if(k<TOTAL) await sleep(260)
@@ -631,23 +667,31 @@ export default function App(){
               <div className="card">
                 <h2>Frame comparison</h2>
                 <p style={{marginBottom:10}}>
-                  {framesInfo.dias.length} of {framesInfo.attempted} frames measured successfully — median taken.
+                  {framesInfo.dias.length} of {framesInfo.attempted} frames measured.{' '}
+                  {framesInfo.method?.kind==='consensus'
+                    ? <><b style={{color:'var(--accent2)'}}>{framesInfo.method.n} frames agreed within 0.15 mm</b> — their weighted mean is used. Outliers ignored.</>
+                    : 'No frames agreed closely — median used as a fallback.'}
                 </p>
                 <div style={{display:'flex',flexWrap:'wrap',gap:7}}>
-                  {framesInfo.dias.map((d,i)=>(
-                    <span key={i} className="pill" style={{
-                      background: Math.abs(d-framesInfo.median)<0.001 ? 'rgba(5,196,137,.2)' : 'var(--panel2)',
-                      color: Math.abs(d-framesInfo.median)<0.001 ? 'var(--good)' : 'var(--dim)',
-                      fontSize:11, padding:'6px 11px', letterSpacing:'.02em'}}>
-                      {d.toFixed(2)}
-                    </span>
-                  ))}
+                  {framesInfo.dias.map((d,i)=>{
+                    const inCluster=framesInfo.method?.used?.some(u=>Math.abs(u-d)<0.001)
+                    return (
+                      <span key={i} className="pill" style={{
+                        background: inCluster ? 'rgba(5,196,137,.2)' : 'var(--panel2)',
+                        color: inCluster ? 'var(--good)' : 'var(--dim)',
+                        textDecoration: inCluster ? 'none' : 'line-through',
+                        fontSize:11, padding:'6px 11px', letterSpacing:'.02em'}}>
+                        {d.toFixed(2)}
+                      </span>
+                    )
+                  })}
                 </div>
                 <p style={{marginTop:10,fontSize:12.5}}>
-                  Spread {framesInfo.spread.toFixed(2)} mm
+                  Result: <b style={{color:'var(--ink)'}}>{framesInfo.median.toFixed(2)} mm</b> · spread {framesInfo.spread.toFixed(2)} mm
                   {framesInfo.spread<=0.15 ? ' — excellent agreement.' :
                    framesInfo.spread<=0.30 ? ' — good agreement.' :
-                   ' — frames disagree more than usual. Consider retaking with steadier hands / better light.'}
+                   framesInfo.method?.kind==='consensus' ? ' overall, but the consensus cluster is tight.' :
+                   ' — consider retaking with steadier hands / better light.'}
                 </p>
               </div>
             )}
