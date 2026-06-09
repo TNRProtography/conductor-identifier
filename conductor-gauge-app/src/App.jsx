@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { TABLE } from './lib/conductors.js'
-import { applyVerified, confirmConductor, syncVerified, shotToJpeg } from './lib/learning.js'
+import { applyVerified, confirmConductor, syncVerified, shotToJpeg, serverEnabled, lastSync } from './lib/learning.js'
 import {
   CARD, MARKER_PROMPTS, homography, applyH,
   autoMarkers, detectConductor, detectConductorLive, materialFromEdges, drawOverlay, countStrands, analyzeWinding
@@ -176,7 +176,13 @@ export default function App(){
   },[material,stiffness,manualStrands,covered])
 
   /* ---------- shared verified library: pull on launch ---------- */
-  useEffect(()=>{ syncVerified() },[])
+  useEffect(()=>{
+    syncVerified().then(agg=>{
+      if(!serverEnabled()) return                       // not configured — silent local mode
+      if(agg && lastSync.ok) showToast(`Team library connected · ${lastSync.count} verified conductor${lastSync.count===1?'':'s'}`)
+      else showToast(lastSync.status===401?'Team library: API key rejected — check learning.js':'Team library unreachable — using local data')
+    })
+  },[showToast])
 
   /* ---------- AR LIVE OVERLAY (runs while camera is active) ---------- */
   /* Video is hidden; each frame is drawn onto the visible canvas, then detection

@@ -14,6 +14,8 @@ const AGGK  = 'cg-server-aggregate';        // cached server aggregate
 const QK    = 'cg-confirm-queue';           // unsent confirmations
 
 const enabled = () => !!(WORKER_URL && API_KEY);
+export const serverEnabled = enabled;
+export let lastSync = { ok:false, count:0, ts:null };
 
 /* ---------------- local store (unchanged v1 behaviour) ---------------- */
 export function loadVerified(){
@@ -41,9 +43,12 @@ export async function syncVerified(){
     const r = await fetch(WORKER_URL + '/api/verified', { headers: { 'x-api-key': API_KEY } });
     if(r.ok){
       serverAgg = await r.json();
+      lastSync = { ok:true, count:Object.keys(serverAgg).length, ts:Date.now() };
       try { localStorage.setItem(AGGK, JSON.stringify(serverAgg)); } catch {}
+    } else {
+      lastSync = { ok:false, count:0, ts:Date.now(), status:r.status };
     }
-  }catch{}
+  }catch{ lastSync = { ok:false, count:0, ts:Date.now(), status:'network' }; }
   flushQueue();               // good moment to retry unsent confirmations
   return serverAgg;
 }
