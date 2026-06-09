@@ -388,16 +388,8 @@ export default function App(){
   return (
     <>
       <header>
-        <div className="wp-logo">
-          <svg width="34" height="28" viewBox="0 0 34 28" fill="none">
-            <path d="M6 22C6 13 13 7 24 5C20 13 12 19 6 22Z" fill="#05C489"/>
-            <path d="M10 26.5C14 18 24 13.5 33 13.5C26.5 19.5 17 24 10 26.5Z" fill="#05C489" opacity="0.65"/>
-          </svg>
-          <div className="wp-wordmark">
-            <span className="name">Westpower</span>
-            <span className="sub">Conductor Gauge</span>
-          </div>
-        </div>
+        <img src="./Primary-Logo-Light.svg" alt="Westpower" className="wp-logo-img" />
+        <span className="conductor-sub">Conductor Gauge</span>
       </header>
 
       <main>
