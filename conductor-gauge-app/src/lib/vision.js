@@ -451,7 +451,127 @@ export function detectConductor(shot, markers){
   return { dia, matHint, calA, calB, topPts, botPts, Hinv,
            nScans:centers.length, tilt:Math.atan(b)*180/Math.PI,
            bow, ridge:rMed, layer, layPeriod, quality,
+           axis:{a,b}, wBand,
            warpMM:(markers.warpMM!=null?markers.warpMM:null) };
+}
+
+
+/* =====================================================================
+   analyzeWinding — strand count from the helical winding pattern
+   1. Rectify a patch of the conductor surface into (s,t) mm-space:
+      s along the fitted axis, t across it (inner 84% of the face,
+      avoiding the foreshortened edges).
+   2. Remove per-row shading (specular stripes) so only the moving
+      band pattern remains.
+   3. Structure tensor over the patch → dominant gradient orientation
+      = the normal to the winding bands.
+   4. Project every sample onto that normal and autocorrelate the
+      profile → band period = projected strand width d_s.
+   5. Cylinder geometry: N_outer = π·(D − d_s)/d_s.
+      N_outer ≈ 6  → 7-strand class (6+1: 7-wire Cu/AAC or 6/1 ACSR)
+      N_outer ≈ 12 → 19-strand class (12+6+1)
+      N_outer ≈ 18 → 37-strand class (18+12+6+1)
+      (The core is inferred from standard constructions — it can't be
+       seen from the side, as expected.)
+   ===================================================================== */
+export function analyzeWinding(shot, markers, det){
+  if(!det || !det.axis || !det.wBand) return null;
+  const imgW=shot.width, imgH=shot.height;
+  const Hinv=det.Hinv || homography(CARD, markers);
+  const img=shot.getContext("2d").getImageData(0,0,imgW,imgH).data;
+  const px=(ix,iy)=>{ ix|=0; iy|=0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
+    const o=(iy*imgW+ix)*4; return img[o]*0.299+img[o+1]*0.587+img[o+2]*0.114; };
+  const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
+  const {a,b}=det.axis, D=det.wBand;
+
+  // --- 1. rectified patch ---
+  const S0=46, SST=0.3;                       // s: ±46 mm along the axis, 0.3 mm step
+  const TT=0.42*D, TST=Math.max(0.05, D/70);  // t: inner 84% of the face
+  const sN=Math.floor(2*S0/SST)+1, tN=Math.floor(2*TT/TST)+1;
+  if(tN<8) return null;                        // conductor too thin to analyse
+  const G=[];
+  for(let r=0;r<tN;r++){
+    const t=-TT+r*TST, row=new Float32Array(sN);
+    for(let c2=0;c2<sN;c2++){
+      const s=-S0+c2*SST, cen=a+b*s;
+      const p=toImg(s, cen+t), v=px(p.x,p.y);
+      row[c2]=v==null?NaN:v;
+    }
+    G.push(row);
+  }
+  // --- 2. per-row mean removal (kills static cross-face shading) ---
+  for(let r=0;r<tN;r++){
+    let m=0,n=0; for(let c2=0;c2<sN;c2++) if(!isNaN(G[r][c2])){m+=G[r][c2];n++;}
+    if(!n){continue;} m/=n;
+    for(let c2=0;c2<sN;c2++) G[r][c2]=isNaN(G[r][c2])?0:G[r][c2]-m;
+  }
+  // --- 3. structure tensor (gradients per mm) ---
+  let Jss=0,Jtt=0,Jst=0;
+  for(let r=1;r<tN-1;r++) for(let c2=1;c2<sN-1;c2++){
+    const gs=(G[r][c2+1]-G[r][c2-1])/(2*SST);
+    const gt=(G[r+1][c2]-G[r-1][c2])/(2*TST);
+    Jss+=gs*gs; Jtt+=gt*gt; Jst+=gs*gt;
+  }
+  const tot=Jss+Jtt; if(tot<1e-6) return null;
+  const phi=0.5*Math.atan2(2*Jst, Jss-Jtt);   // dominant gradient orientation (band normal)
+  // coherence: how strongly oriented the pattern is (0 = isotropic noise, 1 = perfect bands)
+  const coher=Math.sqrt((Jss-Jtt)*(Jss-Jtt)+4*Jst*Jst)/tot;
+  if(coher<0.18) return null;                  // no winding pattern (smooth / covered)
+
+  // --- 4. profile along the band normal, autocorrelation ---
+  const nx=Math.cos(phi), ny=Math.sin(phi);
+  const UB=0.05;                                // 0.05 mm bins
+  const bins=new Map();
+  for(let r=0;r<tN;r++){
+    const t=-TT+r*TST;
+    for(let c2=0;c2<sN;c2++){
+      const s=-S0+c2*SST;
+      const u=Math.round((s*nx+t*ny)/UB);
+      const e=bins.get(u); if(e){e.s+=G[r][c2];e.n++;} else bins.set(u,{s:G[r][c2],n:1});
+    }
+  }
+  const ks=[...bins.keys()].sort((x,y)=>x-y);
+  const prof=ks.map(k=>{const e=bins.get(k);return e.s/e.n;});
+  const M=prof.length; if(M<40) return null;
+  let mean=0; for(const v of prof) mean+=v; mean/=M;
+  const dprof=prof.map(v=>v-mean);
+  let v0=0; for(const v of dprof) v0+=v*v; v0/=M;
+  if(v0<1e-6) return null;
+  // search lags from D/9 (37-wire strand) to D/2 (oversized guard)
+  const lagMin=Math.max(3, Math.round((D/9)/UB));
+  const lagMax=Math.min(M-10, Math.round((D/1.8)/UB));
+  let best=-1, bestLag=0;
+  for(let lag=lagMin;lag<=lagMax;lag++){
+    let s2=0,n2=0;
+    for(let i2=0;i2+lag<M;i2++){ s2+=dprof[i2]*dprof[i2+lag]; n2++; }
+    const r2=n2?(s2/n2)/v0:0;
+    if(r2>best){ best=r2; bestLag=lag; }
+  }
+  if(best<0.22) return null;                   // weak periodicity
+  // harmonic correction: a periodic signal correlates at every multiple of its
+  // true period — if half the winning lag also correlates strongly, the winner
+  // was the 2nd harmonic. Walk down until the fundamental is found.
+  const rAt=(lag)=>{ if(lag<lagMin||lag>lagMax) return -1;
+    let s2=0,n2=0; for(let i2=0;i2+lag<M;i2++){ s2+=dprof[i2]*dprof[i2+lag]; n2++; }
+    return n2?(s2/n2)/v0:-1; };
+  let guard=0;
+  while(guard++<3){
+    const half=Math.round(bestLag/2);
+    const rH=rAt(half);
+    if(half>=lagMin && rH>0.7*best && rH>0.22){ bestLag=half; best=rH; } else break;
+  }
+  const dStrand=bestLag*UB;                    // projected strand width, mm
+
+  // --- 5. cylinder geometry → outer strand count ---
+  const nOuter=Math.round(Math.PI*(D-dStrand)/dStrand);
+  let layer=null, total=null, label=null;
+  if(nOuter>=4 && nOuter<=8){ layer='o6'; total=7;  label='6 outer + core (7-strand class: 7-wire or 6/1 ACSR)'; }
+  else if(nOuter>=9 && nOuter<=14){ layer='19'; total=19; label='12 outer (19-strand class: 12+6+1)'; }
+  else if(nOuter>=15 && nOuter<=24){ layer='37'; total=37; label='18 outer (37-strand class: 18+12+6+1)'; }
+  if(!layer) return null;
+  const angleDeg=Math.abs(90-Math.abs(phi*180/Math.PI));  // band angle vs the axis
+  return { strandW:+dStrand.toFixed(2), nOuter, total, layer, label,
+           angleDeg:+angleDeg.toFixed(1), coherence:+coher.toFixed(2), strength:+best.toFixed(2) };
 }
 
 /* classify material from two manual edge taps */

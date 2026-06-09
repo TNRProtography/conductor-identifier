@@ -3,7 +3,7 @@ import { TABLE } from './lib/conductors.js'
 import { applyVerified, confirmMeasurement, loadVerified } from './lib/learning.js'
 import {
   CARD, MARKER_PROMPTS, homography, applyH,
-  autoMarkers, detectConductor, detectConductorLive, materialFromEdges, drawOverlay, countStrands
+  autoMarkers, detectConductor, detectConductorLive, materialFromEdges, drawOverlay, countStrands, analyzeWinding
 } from './lib/vision.js'
 
 const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
@@ -364,19 +364,25 @@ export default function App(){
     const shot=shotRef.current
     const dets=[]
     // main frame
-    try{ const d=detectConductor(shot,mk); if(d) dets.push(d) }catch{}
+    try{ const d=detectConductor(shot,mk); if(d) dets.push({det:d,src:shot,mk}) }catch{}
     // burst frames — markers re-found per frame (slight hand motion between frames)
     for(const c of burstRef.current){
       try{
         const m2=autoMarkers(c)||mk
-        const d=detectConductor(c,m2); if(d) dets.push(d)
+        const d=detectConductor(c,m2); if(d) dets.push({det:d,src:c,mk:m2})
       }catch{}
     }
     if(!dets.length) return false
     // median diameter wins; keep that frame's det for the overlay
-    dets.sort((a,b)=>a.dia-b.dia)
-    const det=dets[dets.length>>1]
-    const dias=dets.map(d=>d.dia)
+    dets.sort((a,b)=>a.det.dia-b.det.dia)
+    const pick=dets[dets.length>>1]
+    const det=pick.det
+    // winding analysis on the winning frame: strand count from the helix pattern
+    try{
+      const wind=analyzeWinding(pick.src, pick.mk, det)
+      if(wind){ det.winding=wind; det.layer=wind.layer }   // winding evidence beats ridge count
+    }catch{}
+    const dias=dets.map(d=>d.det.dia)
     setFramesInfo({ dias, attempted:1+burstRef.current.length,
       spread:dias.length>1 ? dias[dias.length-1]-dias[0] : 0, median:det.dia })
     setSceneWarn(sceneChecks(mk, shot.width, shot.height, det))
@@ -645,6 +651,19 @@ export default function App(){
                 </p>
               </div>
             )}
+            {pendDet.current?.winding && (
+              <div className="card">
+                <h2>Winding analysis</h2>
+                <p style={{marginBottom:8}}>
+                  Strand width on the face: <b style={{color:'var(--ink)'}}>{pendDet.current.winding.strandW} mm</b>
+                  {' '}→ <b style={{color:'var(--accent2)'}}>~{pendDet.current.winding.nOuter} outer strands</b>
+                </p>
+                <div className="note" style={{borderColor:'var(--accent2)',background:'rgba(5,196,137,.07)'}}>
+                  {pendDet.current.winding.label}. Lay angle ~{pendDet.current.winding.angleDeg}°.
+                  The core can't be seen from the side — the total assumes standard construction.
+                </div>
+              </div>
+            )}
             <div className="card">
               <h2>Measured</h2>
               <div className="readout" style={{fontSize:38}}>{pendDia.current.toFixed(2)}<small> mm OD</small></div>
@@ -675,7 +694,7 @@ export default function App(){
                   <button key={v} className={stiffness===v?'on':''} onClick={()=>setStiffness(stiffness===v?null:v)}>{l}</button>)}
               </div>
 
-              <div className="strand-label">Strand count {pendDet.current?.layer && <span style={{color:'var(--accent2)'}}>(photo suggests {pendDet.current.layer==='o6'?'6-outer':pendDet.current.layer+'-wire'})</span>}</div>
+              <div className="strand-label">Strand count {pendDet.current?.layer && <span style={{color:'var(--accent2)'}}>({pendDet.current.winding?'winding shows':'photo suggests'} {pendDet.current.layer==='o6'?'7-strand class':pendDet.current.layer+'-wire'})</span>}</div>
               <div className="seg strands" style={{marginBottom:14}}>
                 {[['?','?'],['7','7w'],['6/1','6/1'],['19','19w'],['37','37w']].map(([v,l])=>
                   <button key={v} className={manualStrands===v?'on':''} onClick={()=>setManualStrands(manualStrands===v?null:v)}>{l}</button>)}
