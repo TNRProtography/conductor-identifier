@@ -9,6 +9,34 @@ import {
 const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
   return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()) }
 
+
+/* environment guardrails — warn (don't block) when conditions hurt accuracy */
+function sceneChecks(markers, imgW, imgH, det){
+  const out=[]
+  if(!markers || markers.length!==4) return out
+  // card too small in frame
+  const area=Math.abs((markers[1].x-markers[0].x)*(markers[3].y-markers[0].y)
+            -(markers[1].y-markers[0].y)*(markers[3].x-markers[0].x))
+  if(area < imgW*imgH*0.10) out.push('Card is small in the frame — move closer for more pixels per mm.')
+  // card near the frame edge (lens distortion is worst there)
+  const m=0.04
+  if(markers.some(p=>p.x<imgW*m||p.x>imgW*(1-m)||p.y<imgH*m||p.y>imgH*(1-m)))
+    out.push('Card is near the frame edge — centre it to avoid lens-distortion error.')
+  // strong perspective
+  const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y)
+  const top=d(markers[0],markers[1]), bot=d(markers[3],markers[2])
+  const left=d(markers[0],markers[3]), right=d(markers[1],markers[2])
+  if(Math.max(top,bot)/Math.min(top,bot)>1.25 || Math.max(left,right)/Math.min(left,right)>1.25)
+    out.push('Strong viewing angle — shoot more square-on to the card.')
+  if(det && det.quality){
+    if(det.quality.Lp<90) out.push('Low light — accuracy is reduced. More light on the card will help.')
+    if(det.quality.sigma>18) out.push('Uneven lighting or dappled shadow across the card — even light gives better edges.')
+  }
+  if(det && det.warpMM!=null && det.warpMM>1.5)
+    out.push(`Card appears curled (${det.warpMM.toFixed(1)} mm mid-marker offset) — flatten it for best accuracy.`)
+  return out
+}
+
 function computeMatch(dia, material, det, strandInfo, manualStrands, stiffness){
   const enhanced = applyVerified(TABLE)
   let cands = enhanced.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
@@ -89,6 +117,7 @@ export default function App(){
   const [wall,setWall] = useState(1.5)                     // covering wall thickness mm per side
   const pendDet = useRef(null)                             // detection awaiting confirm screen
   const pendDia = useRef(0)                                // OD (scale/parallax corrected) awaiting confirm
+  const [sceneWarn,setSceneWarn] = useState([])            // environment guardrail warnings
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -155,6 +184,7 @@ export default function App(){
       if(mk&&mk.length===4){
         ox.strokeStyle='#19d3a2'; ox.lineWidth=2;
         mk.forEach(m=>{ ox.beginPath(); ox.arc(m.x,m.y,8,0,7); ox.stroke(); });
+        if(mk.mids) mk.mids.forEach(m=>{ ox.beginPath(); ox.arc(m.x,m.y,6,0,7); ox.stroke(); });
         ox.beginPath(); mk.forEach((m,i)=>i?ox.lineTo(m.x,m.y):ox.moveTo(m.x,m.y));
         ox.closePath(); ox.strokeStyle='rgba(25,211,162,0.3)'; ox.lineWidth=1.5; ox.setLineDash([5,3]); ox.stroke(); ox.setLineDash([]);
         if(det){
@@ -343,6 +373,7 @@ export default function App(){
     // median diameter wins; keep that frame's det for the overlay
     dets.sort((a,b)=>a.dia-b.dia)
     const det=dets[dets.length>>1]
+    setSceneWarn(sceneChecks(mk, shot.width, shot.height, det))
     showToast(dets.length>1?`Measured ${dets.length}× — median taken`:'Conductor found & measured')
     finalize(det); return true
   },[finalize,showToast])
@@ -367,12 +398,43 @@ export default function App(){
     const v=videoRef.current; if(!v || !v.videoWidth) return
     const shot=shotRef.current; shot.width=v.videoWidth; shot.height=v.videoHeight
     shot.getContext('2d').drawImage(v,0,0,shot.width,shot.height)
-    // burst: 2 extra frames ~120 ms apart for the median measurement
+    // full-sensor still where the browser supports it (Android Chrome):
+    // replaces the primary frame with a higher-resolution photo before analysis
+    try{
+      const track=trackRef.current
+      if(track && window.ImageCapture){
+        const ic=new ImageCapture(track)
+        ic.takePhoto().then(blob=>createImageBitmap(blob)).then(bm=>{
+          if(bm.width>shot.width){ shot.width=bm.width; shot.height=bm.height
+            shot.getContext('2d').drawImage(bm,0,0) }
+        }).catch(()=>{})
+      }
+    }catch{}
+    // bracketed burst: 2 extra normal frames, then (if supported) an under- and
+    // an over-exposed frame — 5 frames total. Specular blowout fails in the
+    // under-exposed frame? The others still vote. Dark strands invisible at
+    // normal exposure? The over-exposed frame catches them. Median wins.
     burstRef.current=[]
-    const grabBurst=(k)=>{ if(k>2 || !videoRef.current || !videoRef.current.videoWidth) return done()
-      const c=document.createElement('canvas'); c.width=v.videoWidth; c.height=v.videoHeight
-      c.getContext('2d').drawImage(v,0,0,c.width,c.height); burstRef.current.push(c)
-      if(k<2) setTimeout(()=>grabBurst(k+1),120); else done() }
+    const grabFrame=()=>{ const c=document.createElement('canvas');
+      c.width=v.videoWidth; c.height=v.videoHeight;
+      c.getContext('2d').drawImage(v,0,0,c.width,c.height); burstRef.current.push(c) }
+    const grabBurst=(k)=>{ if(k>2 || !videoRef.current || !videoRef.current.videoWidth) return bracket()
+      grabFrame()
+      if(k<2) setTimeout(()=>grabBurst(k+1),120); else bracket() }
+    const bracket=()=>{
+      const track=trackRef.current
+      const caps=track && track.getCapabilities ? track.getCapabilities() : null
+      if(!caps || !caps.exposureCompensation){ return done() }
+      const {min,max}=caps.exposureCompensation
+      const seq=[ {ev:min*0.6, tag:'under'}, {ev:max*0.6, tag:'over'} ]
+      const stepEV=(i)=>{
+        if(i>=seq.length){ track.applyConstraints({advanced:[{exposureCompensation:0}]}).catch(()=>{}); return done() }
+        track.applyConstraints({advanced:[{exposureCompensation:seq[i].ev}]})
+          .then(()=>setTimeout(()=>{ grabFrame(); stepEV(i+1) },280))
+          .catch(()=>done())
+      }
+      stepEV(0)
+    }
     const done=()=>{
       if(streamRef.current){ streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; trackRef.current=null }
       afterFrames() }
@@ -542,9 +604,20 @@ export default function App(){
 
         {screen==='confirm' && (
           <>
+            {sceneWarn.length>0 && (
+              <div className="note warn">
+                {sceneWarn.map((w,i)=><div key={i} style={{marginBottom:i<sceneWarn.length-1?6:0}}>⚠ {w}</div>)}
+              </div>
+            )}
             <div className="card">
               <h2>Measured</h2>
               <div className="readout" style={{fontSize:38}}>{pendDia.current.toFixed(2)}<small> mm OD</small></div>
+              {pendDet.current && (pendDet.current.warpMM!=null || pendDet.current.layPeriod) && (
+                <p style={{marginTop:6,fontSize:11.5,color:'var(--dim)'}}>
+                  {pendDet.current.warpMM!=null && <>v2 card · 6-marker precision{pendDet.current.layPeriod?' · ':''}</>}
+                  {pendDet.current.layPeriod && <>strand lay period ~{pendDet.current.layPeriod} mm</>}
+                </p>
+              )}
               {pendDet.current && (pendDet.current.ridge==null || pendDet.current.ridge<=1) && (
                 <p style={{marginTop:8,fontSize:12.5}}>No strand ridges visible in the photo — if this conductor has a covering, set it below so the bare-metal size is used for matching.</p>
               )}

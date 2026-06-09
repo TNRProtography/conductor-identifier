@@ -6,6 +6,7 @@
 // - Bow estimation (flexible conductors lie curved; ACSR lies straight)
 
 export const CARD = [ {x:-75,y:50}, {x:75,y:50}, {x:75,y:-50}, {x:-75,y:-50} ]; // TL TR BR BL
+export const MIDS = [ {x:0,y:50}, {x:0,y:-50} ];   // long-side midpoint markers (card v2)
 export const MARKER_PROMPTS = ["TOP-LEFT marker","TOP-RIGHT marker","BOTTOM-RIGHT marker","BOTTOM-LEFT marker"];
 
 /* Copper colour — fresh (bright orange) and oxidised (dark brownish). */
@@ -36,6 +37,22 @@ export function homography(src,dst){
 }
 export function applyH(H,p){ const d=H[6]*p.x+H[7]*p.y+H[8];
   return {x:(H[0]*p.x+H[1]*p.y+H[2])/d, y:(H[3]*p.x+H[4]*p.y+H[5])/d}; }
+
+/* least-squares homography for N≥4 correspondences (normal equations) */
+export function homographyLS(src,dst){
+  const n=src.length, A=[], b=[];
+  for(let i=0;i<n;i++){ const{x,y}=src[i],X=dst[i].x,Y=dst[i].y;
+    A.push([x,y,1,0,0,0,-x*X,-y*X]); b.push(X);
+    A.push([0,0,0,x,y,1,-x*Y,-y*Y]); b.push(Y); }
+  // AtA h = At b
+  const AtA=Array.from({length:8},()=>new Array(8).fill(0));
+  const Atb=new Array(8).fill(0);
+  for(let r=0;r<A.length;r++){
+    for(let i=0;i<8;i++){ Atb[i]+=A[r][i]*b[r];
+      for(let j=0;j<8;j++) AtA[i][j]+=A[r][i]*A[r][j]; } }
+  const h=solveLinear(AtA,Atb);
+  return [h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7],1];
+}
 
 /* ---- auto-detect the 4 corner markers — ROTATION INVARIANT ----
    Markers form a 150×100 mm rectangle. After finding the 4 marker blobs we
@@ -73,8 +90,50 @@ export function autoMarkers(shot){
   cands.sort((a,b)=>b.area-a.area); cands=cands.slice(0,10);
   if(cands.length<4) return null;
 
-  // pick the 4 largest similar-size blobs whose quad is most rectangle-like:
-  // simplest robust pick — 4 largest (markers are the dominant dark squares)
+  // try the v2 6-marker layout first: 4 corners + 2 long-side midpoints
+  let mids=null, warpMM=null;
+  if(cands.length>=6){
+    const six=cands.slice(0,6);
+    const gx6=six.reduce((s,b)=>s+b.cx,0)/6, gy6=six.reduce((s,b)=>s+b.cy,0)/6;
+    // corners are farther from the centroid than the mid markers
+    const byDist=[...six].sort((a,b)=>
+      Math.hypot(b.cx-gx6,b.cy-gy6)-Math.hypot(a.cx-gx6,a.cy-gy6));
+    const cornerCand=byDist.slice(0,4), midCand=byDist.slice(4,6);
+    // wind the 4 corners and assign by long side (same as 4-marker path below)
+    const gxc=cornerCand.reduce((s,b)=>s+b.cx,0)/4, gyc=cornerCand.reduce((s,b)=>s+b.cy,0)/4;
+    const quad6=[...cornerCand].sort((a,b)=>Math.atan2(a.cy-gyc,a.cx-gxc)-Math.atan2(b.cy-gyc,b.cx-gxc));
+    const sl6=[0,1,2,3].map(i=>{const a=quad6[i],b=quad6[(i+1)%4];return Math.hypot(a.cx-b.cx,a.cy-b.cy);});
+    const q6=(sl6[0]+sl6[2]>=sl6[1]+sl6[3])?quad6:[quad6[1],quad6[2],quad6[3],quad6[0]];
+    try{
+      const Hc=homography(CARD, q6.map(p=>({x:p.cx,y:p.cy})));
+      // predicted image positions of the two mid markers
+      const pm=MIDS.map(m=>applyH(Hc,m));
+      // greedy match mid candidates to predictions
+      const used=[false,false]; let errSum=0, okAll=true; const matched=[null,null];
+      for(const mc of midCand){
+        let bi=-1,bd=1e9;
+        for(let i=0;i<2;i++){ if(used[i]) continue;
+          const d=Math.hypot(mc.cx-pm[i].x, mc.cy-pm[i].y); if(d<bd){bd=d;bi=i;} }
+        if(bi<0){ okAll=false; break; }
+        used[bi]=true; matched[bi]=mc; errSum+=bd;
+      }
+      if(okAll && matched[0] && matched[1]){
+        // express error in mm via local scale (px per mm along the top edge)
+        const e0=Math.hypot(q6[0].cx-q6[1].cx,q6[0].cy-q6[1].cy)/150; // px/mm
+        const errPx=errSum/2;
+        const wm=errPx/(e0||1);
+        if(wm<8){           // plausible mid markers (within 8 mm of prediction)
+          mids=matched.map(p=>({x:p.cx/sc,y:p.cy/sc}));
+          warpMM=wm;
+          const out=q6.map(p=>({x:p.cx/sc,y:p.cy/sc}));
+          out.mids=mids; out.warpMM=warpMM;
+          return out;
+        }
+      }
+    }catch{}
+  }
+
+  // 4-marker fallback (original cards)
   const four=cands.slice(0,4);
   // centroid
   const gx=four.reduce((s,b)=>s+b.cx,0)/4, gy=four.reduce((s,b)=>s+b.cy,0)/4;
@@ -110,7 +169,10 @@ export function autoMarkers(shot){
    ===================================================================== */
 export function detectConductor(shot, markers){
   const imgW=shot.width, imgH=shot.height;
-  const Hinv=homography(CARD, markers);
+  // use all 6 markers (least squares) when the v2 card's mids were found and the card is flat
+  const Hinv=(markers.mids && markers.warpMM!=null && markers.warpMM<1.5)
+    ? homographyLS(CARD.concat(MIDS), [...markers, ...markers.mids])
+    : homography(CARD, markers);
   const img=shot.getContext("2d").getImageData(0,0,imgW,imgH).data;
   const px=(ix,iy)=>{ ix|=0; iy|=0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
     const o=(iy*imgW+ix)*4; return [img[o],img[o+1],img[o+2]]; };
@@ -245,7 +307,7 @@ export function detectConductor(shot, markers){
   const NB=offs2.length;
   const vote=new Float32Array(NB), tot=new Float32Array(NB);
   const lumBins=Array.from({length:NB},()=>[]);
-  const ridgeCounts=[];
+  const ridgeCounts=[], ridgeSpacings=[], layRow=[];
 
   for(const x of XS){
     const st=statsByX.get(x); if(!st) continue;
@@ -258,26 +320,38 @@ export function detectConductor(shot, markers){
       // normalise luminance to this scan's paper so bins are comparable
       lumBins[i].push(col.Ls[i]/st.Lp);
     }
-    // strand-ridge count on this scan
+    // strand ridges on this scan: positions of luminance maxima → count AND spacing
     const run=longestRun(isObj,NB);
     if(run){
       const lo=run[0],hi=run[1];
       if(hi-lo>=6){
-        let count=0, lastMin=col.Ls[lo], peak=-1;
+        const peaksT=[];
+        let lastMin=col.Ls[lo], peak=-1, peakI=-1;
         const prom=Math.max(6, st.sigma*1.5);
         for(let i=lo+1;i<=hi;i++){
           const v2=col.Ls[i]; if(isNaN(v2)) continue;
-          if(peak<0){ if(v2>lastMin+prom){ peak=v2; } else if(v2<lastMin) lastMin=v2; }
-          else { if(v2>peak) peak=v2;
-                 else if(v2<peak-prom){ count++; lastMin=v2; peak=-1; } }
+          if(peak<0){ if(v2>lastMin+prom){ peak=v2; peakI=i; } else if(v2<lastMin) lastMin=v2; }
+          else { if(v2>peak){ peak=v2; peakI=i; }
+                 else if(v2<peak-prom){ peaksT.push(offs2[peakI]); lastMin=v2; peak=-1; } }
         }
-        if(peak>0) count++;
-        if(count>=1 && count<=12) ridgeCounts.push(count);
+        if(peak>0 && peakI>=0) peaksT.push(offs2[peakI]);
+        if(peaksT.length>=1 && peaksT.length<=12){
+          ridgeCounts.push(peaksT.length);
+          for(let k=1;k<peaksT.length;k++) ridgeSpacings.push(Math.abs(peaksT[k-1]-peaksT[k]));
+        }
       }
       const mid=(lo+hi)>>1;
-      if(col.ok[mid]){ rs+=col.R[mid]; gs+=col.G[mid]; bs+=col.B[mid]; ns++; }
+      if(col.ok[mid]){ rs+=col.R[mid]; gs+=col.G[mid]; bs+=col.B[mid]; ns++;
+        // lay rows: normalised inner-band luminance at the run centre per x (for axial period)
+        layRow.push({x, v:col.Ls[mid]/st.Lp});
+      }
     }
   }
+
+  // scene quality: median paper luminance + lighting unevenness across scans
+  const allLp=[...statsByX.values()].map(s=>s.Lp);
+  const allSg=[...statsByX.values()].map(s=>s.sigma);
+  const quality={ Lp:med(allLp), sigma:med(allSg) };
 
   const frac=new Float32Array(NB), medL=new Float32Array(NB);
   for(let i=0;i<NB;i++){ frac[i]=tot[i]?vote[i]/tot[i]:0; medL[i]=lumBins[i].length?med(lumBins[i]):NaN; }
@@ -324,13 +398,34 @@ export function detectConductor(shot, markers){
   if(!(wBand>0.7 && wBand<26)) return null;
   const dia=wBand*cosT;
 
-  // ridge → layer hint
+  // ridge → layer hint. Two estimators that vote:
+  //   count:   number of bright ridges across the diameter (3 / 5 / 7)
+  //   spacing: diameter ÷ median ridge spacing ≈ visible strand count (robust to missed peaks)
   const rMed=ridgeCounts.length>=4 ? med(ridgeCounts) : null;
   let layer=null;
-  if(rMed!=null){
-    if(rMed>=2 && rMed<=4) layer='o6';        // 6 outer strands: 7-wire or 6/1 ACSR
-    else if(rMed===5||rMed===6) layer='19';   // 12 outer: 19-wire class
-    else if(rMed>=7) layer='37';              // 18 outer: 37-wire class
+  const spMed=ridgeSpacings.length>=6 ? med(ridgeSpacings) : null;
+  const nBySpacing=spMed ? wBand/spMed : null;
+  const classify=n=>{ if(n==null) return null;
+    if(n>=2 && n<=4.2) return 'o6'; if(n>4.2 && n<=6.2) return '19'; if(n>6.2) return '37'; return null; };
+  const byCount=classify(rMed), bySpacing=classify(nBySpacing);
+  layer = bySpacing && byCount ? (bySpacing===byCount ? byCount : bySpacing)  // spacing wins disputes
+        : (bySpacing || byCount);
+
+  // axial lay period: autocorrelation of the centre-row luminance along the conductor
+  let layPeriod=null;
+  if(layRow.length>=18){
+    layRow.sort((p,q)=>p.x-q.x);
+    const v=layRow.map(p=>p.v), m=v.reduce((s,t)=>s+t,0)/v.length;
+    const d=v.map(t=>t-m), n=d.length;
+    let best=-1, bestLag=0;
+    for(let lag=2;lag<=Math.min(8,n-6);lag++){     // lags of 6–24 mm (x step ≈ 3 mm)
+      let s=0,c2=0;
+      for(let i=0;i+lag<n;i++){ s+=d[i]*d[i+lag]; c2++; }
+      const r=c2?s/c2:0;
+      if(r>best){ best=r; bestLag=lag; }
+    }
+    let v0=0; for(const t of d) v0+=t*t; v0/=n;
+    if(v0>1e-6 && best>0.25*v0) layPeriod=bestLag*3;   // mm between band repeats
   }
 
   // material
@@ -355,7 +450,8 @@ export function detectConductor(shot, markers){
 
   return { dia, matHint, calA, calB, topPts, botPts, Hinv,
            nScans:centers.length, tilt:Math.atan(b)*180/Math.PI,
-           bow, ridge:rMed, layer };
+           bow, ridge:rMed, layer, layPeriod, quality,
+           warpMM:(markers.warpMM!=null?markers.warpMM:null) };
 }
 
 /* classify material from two manual edge taps */
