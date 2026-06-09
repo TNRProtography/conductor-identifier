@@ -1,15 +1,19 @@
-/* Copper colour detection — handles fresh (bright orange) and oxidised (dark brownish) copper.
-   Oxidised copper has lower saturation but retains a warm hue in the 10-65° range. */
-function isCopper(sat,hue,lum=128){
-  if(sat>0.18 && hue>=2 && hue<=62) return true;   // fresh/lightly oxidised copper
-  if(sat>0.09 && hue>=10 && hue<=55 && lum<160) return true; // dark oxidised copper
-  return false;
-}
+// Conductor Gauge — vision engine v2 (full rework)
+// - Rotation-invariant marker assignment: card works in ANY orientation
+// - Two-pass conductor detection with cross-scan voting: shadows can't win
+// - Robust axis fit (Theil–Sen) + tilt correction
+// - Visual strand-ridge counting (6-outer vs 19-wire vs 37-wire)
+// - Bow estimation (flexible conductors lie curved; ACSR lies straight)
 
-// Conductor Gauge — vision engine (framework-agnostic, validated).
-// Card geometry MUST match the printed marker card.
 export const CARD = [ {x:-75,y:50}, {x:75,y:50}, {x:75,y:-50}, {x:-75,y:-50} ]; // TL TR BR BL
 export const MARKER_PROMPTS = ["TOP-LEFT marker","TOP-RIGHT marker","BOTTOM-RIGHT marker","BOTTOM-LEFT marker"];
+
+/* Copper colour — fresh (bright orange) and oxidised (dark brownish). */
+function isCopper(sat,hue,lum=128){
+  if(sat>0.18 && hue>=2 && hue<=62) return true;
+  if(sat>0.09 && hue>=10 && hue<=55 && lum<160) return true;
+  return false;
+}
 
 /* ---- homography ---- */
 export function solveLinear(A,b){
@@ -33,7 +37,12 @@ export function homography(src,dst){
 export function applyH(H,p){ const d=H[6]*p.x+H[7]*p.y+H[8];
   return {x:(H[0]*p.x+H[1]*p.y+H[2])/d, y:(H[3]*p.x+H[4]*p.y+H[5])/d}; }
 
-/* ---- auto-detect the 4 corner markers ---- */
+/* ---- auto-detect the 4 corner markers — ROTATION INVARIANT ----
+   Markers form a 150×100 mm rectangle. After finding the 4 marker blobs we
+   sort them angularly around their centroid, then identify the LONG sides
+   (150 mm) by comparing opposite side-length sums. Corners are assigned so
+   the card-space x axis always runs along the long side — i.e. along the
+   conductor channel — no matter how the phone or card is rotated. */
 export function autoMarkers(shot){
   const imgW=shot.width, imgH=shot.height;
   const MAXD=720, sc=Math.min(1,MAXD/Math.max(imgW,imgH));
@@ -44,9 +53,9 @@ export function autoMarkers(shot){
   const gray=new Uint8Array(w*h), hist=new Array(256).fill(0);
   for(let i=0;i<w*h;i++){ const g=(id[i*4]*0.299+id[i*4+1]*0.587+id[i*4+2]*0.114)|0; gray[i]=g; hist[g]++; }
   let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
-  let sumB=0,wB=0,wF=0,mx=0,th=128,total=w*h;
+  let sumB=0,wB=0,wF=0,mxv=0,th=128,total=w*h;
   for(let i=0;i<256;i++){ wB+=hist[i]; if(!wB) continue; wF=total-wB; if(!wF) break;
-    sumB+=i*hist[i]; const mB=sumB/wB, mF=(sum-sumB)/wF; const v=wB*wF*(mB-mF)*(mB-mF); if(v>mx){mx=v;th=i;} }
+    sumB+=i*hist[i]; const mB=sumB/wB, mF=(sum-sumB)/wF; const v=wB*wF*(mB-mF)*(mB-mF); if(v>mxv){mxv=v;th=i;} }
   const dark=new Uint8Array(w*h); for(let i=0;i<w*h;i++) dark[i]=gray[i]<th?1:0;
   const lab=new Int32Array(w*h); let next=1; const blobs=[], stack=[];
   for(let i=0;i<w*h;i++){
@@ -63,89 +72,290 @@ export function autoMarkers(shot){
   let cands=blobs.filter(b=>b.area>minA && b.area<maxA && b.fill>0.7 && b.ar>0.6 && b.ar<1.7);
   cands.sort((a,b)=>b.area-a.area); cands=cands.slice(0,10);
   if(cands.length<4) return null;
-  const byPS=[...cands].sort((a,b)=>(a.cx+a.cy)-(b.cx+b.cy));
-  const byMS=[...cands].sort((a,b)=>(a.cx-a.cy)-(b.cx-b.cy));
-  const pick=[byPS[0], byMS[byMS.length-1], byPS[byPS.length-1], byMS[0]]; // TL TR BR BL
-  for(let i=0;i<4;i++) for(let j=i+1;j<4;j++) if(pick[i]===pick[j]) return null;
-  return pick.map(p=>({x:p.cx/sc, y:p.cy/sc}));
+
+  // pick the 4 largest similar-size blobs whose quad is most rectangle-like:
+  // simplest robust pick — 4 largest (markers are the dominant dark squares)
+  const four=cands.slice(0,4);
+  // centroid
+  const gx=four.reduce((s,b)=>s+b.cx,0)/4, gy=four.reduce((s,b)=>s+b.cy,0)/4;
+  // angular sort around centroid → consistent quad winding
+  const quad=[...four].sort((a,b)=>Math.atan2(a.cy-gy,a.cx-gx)-Math.atan2(b.cy-gy,b.cx-gx));
+  // side lengths of the wound quad
+  const sl=[0,1,2,3].map(i=>{ const a=quad[i], b=quad[(i+1)%4]; return Math.hypot(a.cx-b.cx,a.cy-b.cy); });
+  // The 150 mm sides are the pair of opposite sides with the larger sum.
+  // sides 0&2 vs sides 1&3
+  let q;
+  if(sl[0]+sl[2] >= sl[1]+sl[3]){
+    // side 0 (quad0→quad1) is LONG ⇒ quad0,quad1 are one long edge (top or bottom — equivalent)
+    q=[quad[0],quad[1],quad[2],quad[3]];   // TL TR BR BL
+  } else {
+    // side 1 (quad1→quad2) is LONG ⇒ rotate assignment by one
+    q=[quad[1],quad[2],quad[3],quad[0]];
+  }
+  // sanity: all four distinct
+  for(let i=0;i<4;i++) for(let j=i+1;j<4;j++) if(q[i]===q[j]) return null;
+  return q.map(p=>({x:p.cx/sc, y:p.cy/sc}));
 }
 
-/* ---- detect the conductor on the lane and measure its width ---- */
+/* =====================================================================
+   detectConductor v2 — two-pass voting detector
+   PASS 1: per-scan classification + run finding → rough centres
+           robust Theil–Sen axis fit through the centres
+   PASS 2: re-sample every scan in the axis-centred frame; every scan
+           votes per perpendicular offset t: "conductor here or not".
+           Edges = where the vote fraction crosses 50 % (sub-bin interp).
+           Diameter = band width × cos(tilt).
+   Extras: per-scan strand-ridge counting → layer hint (o6/19/37)
+           bow estimate from quadratic fit of centres
+   ===================================================================== */
 export function detectConductor(shot, markers){
   const imgW=shot.width, imgH=shot.height;
   const Hinv=homography(CARD, markers);
   const img=shot.getContext("2d").getImageData(0,0,imgW,imgH).data;
-  const px=(ix,iy)=>{ ix=ix|0; iy=iy|0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
+  const px=(ix,iy)=>{ ix|=0; iy|=0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
     const o=(iy*imgW+ix)*4; return [img[o],img[o+1],img[o+2]]; };
   const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
-  const med=a=>{ const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
-  const Y0=22, STEP=0.06, GAP=Math.round(1.4/STEP), SM=Math.max(1,Math.round(0.05/STEP));
-  const WT=Math.max(2,Math.round(0.28/STEP));   // texture window (~0.28 mm)
-  const KG=Math.max(1,Math.round(0.10/STEP));   // gradient span for edge snap
-  const ys=[]; for(let y=Y0;y>=-Y0;y-=STEP) ys.push(y);
-  const N=ys.length;
-  const widths=[], topPts=[], botPts=[]; let rs=0,gs=0,bs=0,ns=0;
+  const med=a=>{ if(!a.length) return NaN; const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
 
-  for(let x=-54;x<=54;x+=3){
-    const L=new Float32Array(N), R=new Float32Array(N), G=new Float32Array(N), B=new Float32Array(N), ok=new Uint8Array(N);
-    for(let i=0;i<N;i++){ const p=toImg(x,ys[i]), c=px(p.x,p.y);
-      if(!c){ ok[i]=0; continue; } ok[i]=1; R[i]=c[0]; G[i]=c[1]; B[i]=c[2]; L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2]; }
-    const Ls=new Float32Array(N);
-    for(let i=0;i<N;i++){ let s=0,n=0; for(let j=-SM;j<=SM;j++){ const t=i+j; if(t>=0&&t<N&&ok[t]){s+=L[t];n++;} } Ls[i]=n?s/n:NaN; }
-    // local TEXTURE (std of luminance) — conductors are textured; paper & shadows are smooth
-    const tex=new Float32Array(N);
-    for(let i=0;i<N;i++){ if(!ok[i]){tex[i]=0;continue;} let s=0,s2=0,n=0;
-      for(let j=-WT;j<=WT;j++){ const t=i+j; if(t>=0&&t<N&&ok[t]){ s+=L[t]; s2+=L[t]*L[t]; n++; } }
-      tex[i]= n? Math.sqrt(Math.max(0, s2/n-(s/n)*(s/n))) : 0; }
-    // paper reference (luminance + colour + texture) from the outer region |y|>16
-    const oL=[],oR=[],oG=[],oB=[],oT=[];
-    for(let i=0;i<N;i++) if(ok[i] && Math.abs(ys[i])>16){ oL.push(Ls[i]); oR.push(R[i]); oG.push(G[i]); oB.push(B[i]); oT.push(tex[i]); }
-    if(oL.length<12) continue;
-    const Lp=med(oL), Rp=med(oR), Gp=med(oG), Bp=med(oB), Tp=med(oT);
-    let v=0; for(const l of oL) v+=(l-Lp)*(l-Lp); const sigma=Math.sqrt(v/oL.length);
-    const Tlum=Math.max(9, 2.6*sigma);
-    const Ttex=Math.max(6, Tp*3+2.5);            // texture must clearly exceed the paper's
-    const sP=(Rp+Gp+Bp)||1, rp=Rp/sP, gp=Gp/sP;  // paper chromaticity (brightness-independent)
-    const chroma=i=>{ const s=(R[i]+G[i]+B[i])||1; return (Math.abs(R[i]/s-rp)+Math.abs(G[i]/s-gp))*510; };
-    const Tchr=24;                               // hue/chroma shift (copper etc.) — NOT triggered by neutral shadow
-    // A sample is conductor if it is TEXTURED, specular-bright, or genuinely off-hue (e.g. copper).
-    // Being merely darker than the paper is what a SHADOW looks like, so that alone never qualifies.
-    const isObj=i=>{ if(!ok[i]||isNaN(Ls[i])) return false;
-      return tex[i]>Ttex || Ls[i]>Lp+1.4*Tlum || chroma(i)>Tchr; };
-    // longest run, bridging small smooth gaps inside the conductor
-    let bestLo=-1,bestHi=-1,bestLen=-1, i=0;
-    while(i<N){
-      if(isObj(i)){ let lo=i,hi=i,gap=0,j=i+1;
-        while(j<N){ if(isObj(j)){ hi=j; gap=0; } else if(++gap>GAP) break; j++; }
-        if(hi-lo>bestLen){ bestLen=hi-lo; bestLo=lo; bestHi=hi; } i=hi+1; }
-      else i++; }
-    if(bestLo<0) continue;
-    // snap each boundary to the nearest sharp luminance edge (true metal/paper transition),
-    // searching only just inside/outside the run so internal strand edges are ignored.
-    const grad=k=>{ const a=(k-KG>=0)?Ls[k-KG]:Ls[k], b=(k+KG<N)?Ls[k+KG]:Ls[k]; return Math.abs(b-a); };
-    const snap=(idx,dir)=>{ let best=idx,bg=-1; for(let d=-WT;d<=WT;d++){ const k=idx+d; if(k<1||k>=N-1||!ok[k]) continue;
-      const gk=grad(k); if(gk>bg){ bg=gk; best=k; } } return best; };
-    bestLo=snap(bestLo,-1); bestHi=snap(bestHi,1);
-    const yTop=ys[bestLo], yBot=ys[bestHi];
-    const w=yTop-yBot, cen=(yTop+yBot)/2;
-    if(w>0.8 && w<24 && Math.abs(cen)<16){
-      widths.push(w); topPts.push({x,y:yTop}); botPts.push({x,y:yBot});
-      const m=toImg(x,cen), c=px(m.x,m.y); if(c){ rs+=c[0]; gs+=c[1]; bs+=c[2]; ns++; } }
+  const STEP=0.06, Y0=22;
+  const SM=Math.max(1,Math.round(0.05/STEP));
+  const TW=Math.max(2,Math.round(0.25/STEP));
+  const GAP=Math.round(2.0/STEP);
+  const XS=[]; for(let x=-54;x<=54;x+=3) XS.push(x);
+
+  // ---------- shared per-scan machinery ----------
+  // samples a column of values at card-x = x along offsets list `offs` (mm, in +y direction
+  // from base position baseY(off)), returns {L,R,G,B,ok,Ls,tex}
+  function sampleColumn(x, offs, centerY){
+    const n=offs.length;
+    const L=new Float32Array(n),R=new Float32Array(n),G=new Float32Array(n),B=new Float32Array(n),ok=new Uint8Array(n);
+    for(let i=0;i<n;i++){
+      const p=toImg(x, centerY+offs[i]), c=px(p.x,p.y);
+      if(!c){ok[i]=0;continue;} ok[i]=1; R[i]=c[0];G[i]=c[1];B[i]=c[2];
+      L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2];
+    }
+    const Ls=new Float32Array(n);
+    for(let i=0;i<n;i++){ let s=0,m=0;
+      for(let j=-SM;j<=SM;j++){ const t=i+j; if(t>=0&&t<n&&ok[t]){s+=L[t];m++;} }
+      Ls[i]=m?s/m:NaN; }
+    const tex=new Float32Array(n);
+    for(let i=0;i<n;i++){ if(!ok[i]){tex[i]=0;continue;} let s=0,s2=0,m=0;
+      for(let j=-TW;j<=TW;j++){ const t=i+j; if(t>=0&&t<n&&ok[t]){ s+=L[t];s2+=L[t]*L[t];m++; } }
+      tex[i]=m?Math.sqrt(Math.max(0,s2/m-(s/m)*(s/m))):0; }
+    return {L,R,G,B,ok,Ls,tex,n};
   }
-  if(widths.length<4) return null;
-  // reject scan outliers, then take the median width
-  const mw=med(widths); const kw=[],kt=[],kb=[];
-  for(let i=0;i<widths.length;i++) if(Math.abs(widths[i]-mw) <= 0.3*mw+0.4){ kw.push(widths[i]); kt.push(topPts[i]); kb.push(botPts[i]); }
-  const tw=kw.length?kw:widths, tt=kw.length?kt:topPts, tb=kw.length?kb:botPts;
-  const dia=med(tw);
+
+  // builds paper stats from samples flagged paper (|offset|>paperFrom)
+  function paperStats(col, offs, paperFrom){
+    const oL=[],oR=[],oG=[],oB=[],oT=[];
+    for(let i=0;i<col.n;i++) if(col.ok[i] && Math.abs(offs[i])>paperFrom){
+      oL.push(col.Ls[i]);oR.push(col.R[i]);oG.push(col.G[i]);oB.push(col.B[i]);oT.push(col.tex[i]); }
+    if(oL.length<12) return null;
+    const Lp=med(oL),Rp=med(oR),Gp=med(oG),Bp=med(oB),Tp=med(oT);
+    let v=0; for(const l of oL) v+=(l-Lp)*(l-Lp);
+    const sigma=Math.sqrt(v/oL.length);
+    const sP=(Rp+Gp+Bp)||1;
+    return {Lp, sigma, Tp, rp:Rp/sP, gp:Gp/sP,
+      Tlum:Math.max(8,2.2*sigma), Ttex:Math.max(5,Tp*3+2), Tchr:22,
+      DkTex:Math.max(3.5,(Tp*3+2)*0.3)};
+  }
+
+  // per-sample conductor test — the shadow killer:
+  //  1. brighter than paper  → specular metal (shadow is never brighter)
+  //  2. coloured             → copper / coloured surface (shadow is neutral)
+  //  3. dark AND textured    → strand structure (shadow is dark but SMOOTH)
+  //  4. very deep black      → black covering (a card shadow rarely gets this dark)
+  function makeIsObj(col, st){
+    const chroma=i=>{ const s=(col.R[i]+col.G[i]+col.B[i])||1;
+      return (Math.abs(col.R[i]/s-st.rp)+Math.abs(col.G[i]/s-st.gp))*510; };
+    return i=>{
+      if(!col.ok[i]||isNaN(col.Ls[i])) return false;
+      const dl=col.Ls[i]-st.Lp;
+      if(dl > st.Tlum*0.7) return true;
+      if(chroma(i) > st.Tchr) return true;
+      if(dl < -st.Tlum*0.5 && col.tex[i] > st.DkTex) return true;
+      if(col.Ls[i] < st.Lp*0.55) return true;   // deep/mid-dark metal band (diffuse shadows stay >0.55·paper)
+      return false;
+    };
+  }
+
+  function longestRun(isObj,n){
+    let bestLo=-1,bestHi=-1,bestLen=-1,i=0;
+    while(i<n){
+      if(isObj(i)){ let lo=i,hi=i,gap=0,j=i+1;
+        while(j<n){ if(isObj(j)){hi=j;gap=0;} else if(++gap>GAP) break; j++; }
+        if(hi-lo>bestLen){bestLen=hi-lo;bestLo=lo;bestHi=hi;}
+        i=hi+1; }
+      else i++;
+    }
+    return bestLo<0?null:[bestLo,bestHi];
+  }
+
+  /* ---------------- PASS 1: rough centres ---------------- */
+  const offs1=[]; for(let y=Y0;y>=-Y0;y-=STEP) offs1.push(y);
+  const centers=[];        // {x, c} rough conductor centre per scan
+  const statsByX=new Map(); // paper stats per x (reused in pass 2)
+  let rs=0,gs=0,bs=0,ns=0;
+
+  for(const x of XS){
+    const col=sampleColumn(x,offs1,0);
+    const st=paperStats(col,offs1,16);
+    if(!st) continue;
+    statsByX.set(x,st);
+    const run=longestRun(makeIsObj(col,st),col.n);
+    if(!run) continue;
+    const yTop=offs1[run[0]], yBot=offs1[run[1]];
+    const w=yTop-yBot, cen=(yTop+yBot)/2;
+    if(w>0.7 && w<24 && Math.abs(cen)<16) centers.push({x,c:cen,w});
+  }
+  if(centers.length<5) return null;
+
+  // robust axis: Theil–Sen slope (median of pairwise slopes), median intercept
+  const slopes=[];
+  for(let i=0;i<centers.length;i++) for(let j=i+1;j<centers.length;j++){
+    const dx=centers[j].x-centers[i].x;
+    if(Math.abs(dx)>5) slopes.push((centers[j].c-centers[i].c)/dx);
+  }
+  const b=slopes.length?med(slopes):0;
+  const a=med(centers.map(p=>p.c-b*p.x));
+  const cosT=Math.cos(Math.atan(b));   // tilt correction
+
+  // bow: quadratic residual — fit c = a2 + b2 x + q x², report sag q*54²
+  let bow=0;
+  if(centers.length>=8){
+    // simple least squares for quadratic
+    let Sx=0,Sx2=0,Sx3=0,Sx4=0,Sy=0,Sxy=0,Sx2y=0,n=centers.length;
+    for(const p of centers){ const X=p.x,Y=p.c;
+      Sx+=X;Sx2+=X*X;Sx3+=X*X*X;Sx4+=X*X*X*X;Sy+=Y;Sxy+=X*Y;Sx2y+=X*X*Y; }
+    try{
+      const sol=solveLinear([[n,Sx,Sx2],[Sx,Sx2,Sx3],[Sx2,Sx3,Sx4]],[Sy,Sxy,Sx2y]);
+      bow=Math.abs(sol[2])*54*54;   // sag over the half-span in mm
+    }catch{ bow=0; }
+  }
+
+  /* ---------------- PASS 2: axis-frame aggregation ---------------- */
+  // Every scan is re-sampled in the axis-centred frame. Two aggregates per
+  // perpendicular offset t:
+  //   frac[t]  — fraction of scans whose pixel classifies as conductor (seed band)
+  //   medL[t]  — median luminance across scans (strand spiral averages out,
+  //              so the only sharp gradients left are the TRUE outer edges;
+  //              shadow ramps are soft and lose)
+  const T2=14, ST2=0.05;
+  const offs2=[]; for(let t=T2;t>=-T2;t-=ST2) offs2.push(t);
+  const NB=offs2.length;
+  const vote=new Float32Array(NB), tot=new Float32Array(NB);
+  const lumBins=Array.from({length:NB},()=>[]);
+  const ridgeCounts=[];
+
+  for(const x of XS){
+    const st=statsByX.get(x); if(!st) continue;
+    const cAt=a+b*x;
+    if(Math.abs(cAt)>16) continue;
+    const col=sampleColumn(x,offs2,cAt);
+    const isObj=makeIsObj(col,st);
+    for(let i=0;i<NB;i++){ if(!col.ok[i]) continue;
+      tot[i]++; if(isObj(i)) vote[i]++;
+      // normalise luminance to this scan's paper so bins are comparable
+      lumBins[i].push(col.Ls[i]/st.Lp);
+    }
+    // strand-ridge count on this scan
+    const run=longestRun(isObj,NB);
+    if(run){
+      const lo=run[0],hi=run[1];
+      if(hi-lo>=6){
+        let count=0, lastMin=col.Ls[lo], peak=-1;
+        const prom=Math.max(6, st.sigma*1.5);
+        for(let i=lo+1;i<=hi;i++){
+          const v2=col.Ls[i]; if(isNaN(v2)) continue;
+          if(peak<0){ if(v2>lastMin+prom){ peak=v2; } else if(v2<lastMin) lastMin=v2; }
+          else { if(v2>peak) peak=v2;
+                 else if(v2<peak-prom){ count++; lastMin=v2; peak=-1; } }
+        }
+        if(peak>0) count++;
+        if(count>=1 && count<=12) ridgeCounts.push(count);
+      }
+      const mid=(lo+hi)>>1;
+      if(col.ok[mid]){ rs+=col.R[mid]; gs+=col.G[mid]; bs+=col.B[mid]; ns++; }
+    }
+  }
+
+  const frac=new Float32Array(NB), medL=new Float32Array(NB);
+  for(let i=0;i<NB;i++){ frac[i]=tot[i]?vote[i]/tot[i]:0; medL[i]=lumBins[i].length?med(lumBins[i]):NaN; }
+
+  // seed band: contiguous frac≥0.5 region nearest t=0
+  const c0=Math.round(T2/ST2);
+  let lo=-1,hi=-1;
+  if(frac[c0]>=0.5){ lo=hi=c0; }
+  else for(let d=1;d<NB;d++){
+    if(c0-d>=0 && frac[c0-d]>=0.5){ lo=hi=c0-d; break; }
+    if(c0+d<NB && frac[c0+d]>=0.5){ lo=hi=c0+d; break; }
+  }
+  if(lo<0) return null;
+  while(lo>0    && frac[lo-1]>=0.5) lo--;
+  while(hi<NB-1 && frac[hi+1]>=0.5) hi++;
+  // NOTE: offs2 descends (t: +14 → −14) ⇒ index lo = TOP edge (larger t), hi = BOTTOM edge.
+
+  // aggregated gradient |d medL / d index| (light smoothing)
+  const g=new Float32Array(NB);
+  for(let i=1;i<NB-1;i++){
+    const a1=medL[i-1], a2=medL[i+1];
+    g[i]=(isNaN(a1)||isNaN(a2))?0:Math.abs(a2-a1);
+  }
+  for(let i=1;i<NB-1;i++) g[i]=(g[i-1]+2*g[i]+g[i+1])*0.25;
+
+  // place each edge at the max aggregated gradient near the seed edge:
+  // search 4 mm outward / 1.5 mm inward of the seed edge; parabolic sub-bin refine.
+  const OUT=Math.round(4.0/ST2), IN=Math.round(1.5/ST2);
+  function edgeAt(seedIdx, outwardDir){ // outwardDir: -1 = toward index 0 (larger t), +1 = toward NB-1
+    let k0=seedIdx + outwardDir*OUT, k1=seedIdx - outwardDir*IN;
+    let from=Math.max(1,Math.min(k0,k1)), to=Math.min(NB-2,Math.max(k0,k1));
+    let bi=seedIdx, bg=-1;
+    for(let k=from;k<=to;k++) if(g[k]>bg){ bg=g[k]; bi=k; }
+    // parabolic interpolation around the gradient peak
+    const y1=g[bi-1]||0, y2=g[bi], y3=g[bi+1]||0;
+    const den=(y1-2*y2+y3);
+    const dx=den!==0 ? 0.5*(y1-y3)/den : 0;
+    const idx=bi+Math.max(-1,Math.min(1,dx));
+    return offs2[0]-idx*ST2;  // index → t (offs2 descends linearly)
+  }
+  const tHi=edgeAt(lo,-1);   // top edge: search toward larger t
+  const tLo=edgeAt(hi,+1);   // bottom edge: search toward smaller t
+  const wBand=tHi-tLo;
+  if(!(wBand>0.7 && wBand<26)) return null;
+  const dia=wBand*cosT;
+
+  // ridge → layer hint
+  const rMed=ridgeCounts.length>=4 ? med(ridgeCounts) : null;
+  let layer=null;
+  if(rMed!=null){
+    if(rMed>=2 && rMed<=4) layer='o6';        // 6 outer strands: 7-wire or 6/1 ACSR
+    else if(rMed===5||rMed===6) layer='19';   // 12 outer: 19-wire class
+    else if(rMed>=7) layer='37';              // 18 outer: 37-wire class
+  }
+
+  // material
   let matHint="Aluminium";
-  if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns, mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
-    let h=0,d=mx-mn; if(d>0){ if(mx===Rr)h=60*(((Gg-Bb)/d)%6); else if(mx===Gg)h=60*(((Bb-Rr)/d)+2); else h=60*(((Rr-Gg)/d)+4);} if(h<0)h+=360;
-    const Lm=0.299*Rr+0.587*Gg+0.114*Bb;
-    if(isCopper(S,h,Lm)) matHint="Copper"; }
-  let bi=0,bd=1e9; for(let i=0;i<tt.length;i++){ const dd=Math.abs(tt[i].x); if(dd<bd){bd=dd;bi=i;} }
-  const calA=toImg(tt[bi].x,tt[bi].y), calB=toImg(tb[bi].x,tb[bi].y);
-  return { dia, matHint, calA, calB, topPts:tt, botPts:tb, Hinv, nScans:tw.length };
+  if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns,mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
+    let hh=0,d=mx-mn; if(d>0){if(mx===Rr)hh=60*(((Gg-Bb)/d)%6);else if(mx===Gg)hh=60*(((Bb-Rr)/d)+2);else hh=60*(((Rr-Gg)/d)+4);}if(hh<0)hh+=360;
+    if(isCopper(S,hh,0.299*Rr+0.587*Gg+0.114*Bb)) matHint="Copper"; }
+
+  // edge traces for the overlay — the fitted axis ± half width
+  const topPts=[],botPts=[];
+  const xMin=Math.max(-54, Math.min(...centers.map(p=>p.x)));
+  const xMax=Math.min( 54, Math.max(...centers.map(p=>p.x)));
+  for(let x=xMin;x<=xMax;x+=6){
+    const c=a+b*x;
+    topPts.push({x, y:c+wBand/2});
+    botPts.push({x, y:c-wBand/2});
+  }
+  // caliper at the most central scanned x
+  const cx0=Math.abs(xMin)<Math.abs(xMax)?Math.max(xMin,Math.min(0,xMax)):0;
+  const cc=a+b*cx0;
+  const calA=toImg(cx0, cc+wBand/2), calB=toImg(cx0, cc-wBand/2);
+
+  return { dia, matHint, calA, calB, topPts, botPts, Hinv,
+           nScans:centers.length, tilt:Math.atan(b)*180/Math.PI,
+           bow, ridge:rMed, layer };
 }
 
 /* classify material from two manual edge taps */
@@ -155,24 +365,25 @@ export function materialFromEdges(shot, edges){
   for(let t=0.25;t<=0.75;t+=0.1){
     const x=Math.round(a.x+(b.x-a.x)*t), y=Math.round(a.y+(b.y-a.y)*t);
     for(let dx=-2;dx<=2;dx++) for(let dy=-2;dy<=2;dy++){
-      const px=Math.min(Math.max(x+dx,0),imgW-1), py=Math.min(Math.max(y+dy,0),imgH-1);
-      const d=ctx.getImageData(px,py,1,1).data; R+=d[0];G+=d[1];B+=d[2];n++; } }
+      const px2=Math.min(Math.max(x+dx,0),imgW-1), py=Math.min(Math.max(y+dy,0),imgH-1);
+      const d=ctx.getImageData(px2,py,1,1).data; R+=d[0];G+=d[1];B+=d[2];n++; } }
   R/=n;G/=n;B/=n; const mx=Math.max(R,G,B),mn=Math.min(R,G,B),sat=mx?(mx-mn)/mx:0;
   let hue=0,dl=mx-mn; if(dl>0){ if(mx===R)hue=60*(((G-B)/dl)%6); else if(mx===G)hue=60*(((B-R)/dl)+2); else hue=60*(((R-G)/dl)+4);} if(hue<0)hue+=360;
   return { material:isCopper(sat,hue,0.299*R+0.587*G+0.114*B)?"Copper":"Aluminium", hue, sat };
 }
 
-/* ---- FAST live-preview detector (for AR overlay, ~10x faster) ---- */
+/* ---- FAST live-preview detector (for AR overlay) ----
+   Lightweight per-scan version with the same shadow-resistant rule. */
 export function detectConductorLive(shot, markers){
   const imgW=shot.width, imgH=shot.height;
   const Hinv=homography(CARD, markers);
   const ctx=shot.getContext("2d");
   const img=ctx.getImageData(0,0,imgW,imgH).data;
-  const px=(ix,iy)=>{ ix=ix|0; iy=iy|0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
+  const px=(ix,iy)=>{ ix|=0; iy|=0; if(ix<0||iy<0||ix>=imgW||iy>=imgH) return null;
     const o=(iy*imgW+ix)*4; return [img[o],img[o+1],img[o+2]]; };
   const toImg=(X,Y)=>applyH(Hinv,{x:X,y:Y});
   const med=a=>{ const s=[...a].sort((u,v)=>u-v); return s[s.length>>1]; };
-  const STEP=0.18, GAP=Math.round(1.2/STEP);
+  const STEP=0.18, GAP=Math.round(1.6/STEP);
   const ys=[]; for(let y=20;y>=-20;y-=STEP) ys.push(y); const N=ys.length;
   const widths=[], topPts=[], botPts=[];
   let rs=0,gs=0,bs=0,ns=0;
@@ -180,12 +391,27 @@ export function detectConductorLive(shot, markers){
     const L=new Float32Array(N), ok=new Uint8Array(N), R=new Float32Array(N),G=new Float32Array(N),B=new Float32Array(N);
     for(let i=0;i<N;i++){ const p=toImg(x,ys[i]),c=px(p.x,p.y);
       if(!c){ok[i]=0;continue;} ok[i]=1; R[i]=c[0];G[i]=c[1];B[i]=c[2]; L[i]=0.299*c[0]+0.587*c[1]+0.114*c[2]; }
-    const oL=[];for(let i=0;i<N;i++) if(ok[i]&&Math.abs(ys[i])>14) oL.push(L[i]);
-    if(oL.length<6) continue; oL.sort((a,b)=>a-b); const Lp=oL[oL.length>>1];
+    // light texture (3-sample span)
+    const tex=new Float32Array(N);
+    for(let i=1;i<N-1;i++){ if(ok[i-1]&&ok[i]&&ok[i+1])
+      tex[i]=Math.abs(L[i+1]-L[i-1])+Math.abs(2*L[i]-L[i-1]-L[i+1]); }
+    const oL=[],oR=[],oG=[],oB=[];
+    for(let i=0;i<N;i++) if(ok[i]&&Math.abs(ys[i])>14){ oL.push(L[i]); oR.push(R[i]); oG.push(G[i]); oB.push(B[i]); }
+    if(oL.length<6) continue;
+    const Lp=med(oL), Rp=med(oR), Gp=med(oG), Bp=med(oB);
     let v=0;for(const l of oL) v+=(l-Lp)*(l-Lp); const sigma=Math.sqrt(v/oL.length);
-    const T=Math.max(12,3*sigma);
-    // fast: two-sided luminance deviation only (good enough for preview)
-    const isObj=i=>ok[i] && Math.abs(L[i]-Lp)>T;
+    const Tlum=Math.max(10,2.6*sigma);
+    const sP=(Rp+Gp+Bp)||1, rp=Rp/sP, gp=Gp/sP;
+    const isObj=i=>{
+      if(!ok[i]) return false;
+      const dl=L[i]-Lp;
+      if(dl>Tlum) return true;
+      const s=(R[i]+G[i]+B[i])||1;
+      if((Math.abs(R[i]/s-rp)+Math.abs(G[i]/s-gp))*510>26) return true;
+      if(dl<-Tlum && tex[i]>14) return true;
+      if(L[i]<Lp*0.40) return true;
+      return false;
+    };
     let bestLo=-1,bestHi=-1,bestLen=-1,i=0;
     while(i<N){ if(isObj(i)){let lo=i,hi=i,gap=0,j=i+1;
       while(j<N){if(isObj(j)){hi=j;gap=0;}else if(++gap>GAP)break;j++;}
@@ -200,8 +426,7 @@ export function detectConductorLive(shot, markers){
   let matHint="Aluminium";
   if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns,mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
     let h=0,d=mx-mn; if(d>0){if(mx===Rr)h=60*(((Gg-Bb)/d)%6);else if(mx===Gg)h=60*(((Bb-Rr)/d)+2);else h=60*(((Rr-Gg)/d)+4);}if(h<0)h+=360;
-    const Lm=0.299*Rr+0.587*Gg+0.114*Bb;
-    if(isCopper(S,h,Lm)) matHint="Copper"; }
+    if(isCopper(S,h,0.299*Rr+0.587*Gg+0.114*Bb)) matHint="Copper"; }
   let bi=0,bd=1e9;for(let i=0;i<topPts.length;i++){const dd=Math.abs(topPts[i].x);if(dd<bd){bd=dd;bi=i;}}
   const calA=toImg(topPts[bi].x,topPts[bi].y),calB=toImg(botPts[bi].x,botPts[bi].y);
   return {dia,matHint,calA,calB,topPts,botPts,Hinv,nScans:widths.length};
@@ -209,47 +434,39 @@ export function detectConductorLive(shot, markers){
 
 /* ---- strand counting from a cross-section (end-on) photo ---- */
 export function countStrands(canvas, cx, cy, cropRadius){
-  // cx,cy = centre of conductor end (image px), cropRadius in px
   const ctx=canvas.getContext("2d");
   const r=Math.round(cropRadius), d=r*2;
   const x0=Math.max(0,Math.round(cx)-r), y0=Math.max(0,Math.round(cy)-r);
   const w=Math.min(d, canvas.width-x0), h=Math.min(d, canvas.height-y0);
   if(w<20||h<20) return null;
   const id=ctx.getImageData(x0,y0,w,h).data;
-  // grayscale
   const gray=new Uint8Array(w*h); const hist=new Array(256).fill(0);
   for(let i=0;i<w*h;i++){ const g=(id[i*4]*0.299+id[i*4+1]*0.587+id[i*4+2]*0.114)|0; gray[i]=g; hist[g]++; }
-  // Otsu threshold (strands are bright, gaps are dark)
   let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
   let sB=0,wB=0,wF=0,mx=0,th=128,tot=w*h;
   for(let i=0;i<256;i++){ wB+=hist[i]; if(!wB)continue; wF=tot-wB; if(!wF)break;
     sB+=i*hist[i]; const mB=sB/wB,mF=(sum-sB)/wF,v=wB*wF*(mB-mF)*(mB-mF); if(v>mx){mx=v;th=i;} }
-  // binary mask: bright = strand
   const mask=new Uint8Array(w*h);
   for(let i=0;i<w*h;i++) mask[i]=gray[i]>=th?1:0;
-  // clip to a circular region (the conductor cross-section)
   const cxL=w/2, cyL=h/2, rr=Math.min(w,h)/2*0.92;
   for(let y=0;y<h;y++) for(let x=0;x<w;x++){
     if(Math.hypot(x-cxL,y-cyL)>rr) mask[y*w+x]=0; }
-  // connected components (4-connected)
   const lab=new Int32Array(w*h); let next=1; const blobs=[]; const stack=[];
   for(let i=0;i<w*h;i++){
     if(mask[i] && !lab[i]){ const id2=next++; let area=0,sx=0,sy=0,mnx=w,mxx=0,mny=h,mxy=0;
       stack.push(i); lab[i]=id2;
-      while(stack.length){ const p=stack.pop(), px=p%w, py=(p/w)|0;
-        area++; sx+=px; sy+=py; if(px<mnx)mnx=px; if(px>mxx)mxx=px; if(py<mny)mny=py; if(py>mxy)mxy=py;
-        for(const q of [p-1,p+1,p-w,p+w]){ if(q<0||q>=w*h)continue; if(Math.abs((q%w)-px)>1)continue;
+      while(stack.length){ const p=stack.pop(), px2=p%w, py=(p/w)|0;
+        area++; sx+=px2; sy+=py; if(px2<mnx)mnx=px2; if(px2>mxx)mxx=px2; if(py<mny)mny=py; if(py>mxy)mxy=py;
+        for(const q of [p-1,p+1,p-w,p+w]){ if(q<0||q>=w*h)continue; if(Math.abs((q%w)-px2)>1)continue;
           if(mask[q]&&!lab[q]){ lab[q]=id2; stack.push(q); } } }
       const bw=mxx-mnx+1, bh=mxy-mny+1;
       blobs.push({area, cx:sx/area+x0, cy:sy/area+y0, w:bw, h:bh, fill:area/(bw*bh),
         ar:Math.min(bw,bh)/Math.max(bw,bh)}); }
   }
-  // filter: strand-sized, roughly circular blobs
-  const totalArea=Math.PI*rr*rr; // area of the conductor cross-section
+  const totalArea=Math.PI*rr*rr;
   const minA=totalArea*0.015, maxA=totalArea*0.35;
   const strands=blobs.filter(b=>b.area>minA && b.area<maxA && b.fill>0.55 && b.ar>0.45);
   if(strands.length<2) return null;
-  // identify steel core: the strand closest to the overall centre that's darker than average
   let avgBright=0; strands.forEach(b=>{ let s=0,n=0;
     for(let dy=-3;dy<=3;dy++) for(let dx=-3;dx<=3;dx++){
       const ix=Math.round(b.cx-x0+dx), iy=Math.round(b.cy-y0+dy);
@@ -258,9 +475,8 @@ export function countStrands(canvas, cx, cy, cropRadius){
   avgBright/=strands.length;
   strands.sort((a,b)=>Math.hypot(a.cx-cx,a.cy-cy)-Math.hypot(b.cx-cx,b.cy-cy));
   const center=strands[0];
-  const hasSteel = center.bright < avgBright*0.88;   // centre strand noticeably darker = steel
+  const hasSteel = center.bright < avgBright*0.88;
   const strandCount=strands.length;
-  // standard patterns: 7=6/1, 19=12/6/1, 37=18/12/6/1
   let construction=strandCount+"wire";
   if(hasSteel){
     if(strandCount<=8) construction="6/1 ACSR";
@@ -285,13 +501,13 @@ export function drawOverlay(x, shot, det, dia, markers, banner){
   const lw=Math.max(2,imgW/600);
   const Hinv=det.Hinv || homography(CARD,markers);
   if(det.topPts && det.topPts.length>1){
-    x.lineWidth=lw*1.3; x.strokeStyle="#19d3a2"; x.lineJoin="round";
+    x.lineWidth=lw*1.3; x.strokeStyle="#05C489"; x.lineJoin="round";
     [det.topPts,det.botPts].forEach(pts=>{ x.beginPath();
       pts.forEach((p,i)=>{ const q=applyH(Hinv,{x:p.x,y:p.y}); i?x.lineTo(q.x,q.y):x.moveTo(q.x,q.y); }); x.stroke(); });
   }
   const A=det.calA, B=det.calB;
   const dx=B.x-A.x, dy=B.y-A.y, len=Math.hypot(dx,dy)||1, ux=dx/len, uy=dy/len, tk=lw*7;
-  x.lineWidth=lw*1.8; x.strokeStyle="#e5007d"; x.lineCap="round";
+  x.lineWidth=lw*1.8; x.strokeStyle="#FF7031"; x.lineCap="round";
   x.beginPath(); x.moveTo(A.x,A.y); x.lineTo(B.x,B.y); x.stroke();
   x.beginPath(); x.moveTo(A.x-uy*tk,A.y+ux*tk); x.lineTo(A.x+uy*tk,A.y-ux*tk);
                  x.moveTo(B.x-uy*tk,B.y+ux*tk); x.lineTo(B.x+uy*tk,B.y-ux*tk); x.stroke();
@@ -304,7 +520,7 @@ export function drawOverlay(x, shot, det, dia, markers, banner){
   if(banner){
     const bh=Math.max(120,imgH*0.15), f2=bh*0.30;
     x.fillStyle="rgba(8,11,14,0.82)"; x.fillRect(0,imgH-bh,imgW,bh);
-    x.fillStyle="#19d3a2"; x.textBaseline="middle"; x.font="700 "+f2+"px sans-serif";
+    x.fillStyle="#05C489"; x.textBaseline="middle"; x.font="700 "+f2+"px sans-serif";
     x.fillText(banner, imgW*0.04, imgH-bh*0.5);
   }
 }

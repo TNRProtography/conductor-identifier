@@ -12,16 +12,29 @@ const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
 function computeMatch(dia, material, det, strandInfo, manualStrands, stiffness){
   const enhanced = applyVerified(TABLE)
   let cands = enhanced.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
-  // Strand filter
+  // Strand filter — manual entry > end-on count > visual side-view layer
   const sc = manualStrands || (strandInfo && strandInfo.count && String(strandInfo.count))
   const hasSt = manualStrands==='6/1' || (strandInfo && strandInfo.hasSteel && !manualStrands)
+  const O6 = ['Mullet','Thrush','Flounder','Squirrel','Snipe','Ferret','Mink','Dog'] // 6-outer ACSR
+  const W19 = ['Rango','Weke','Helium','Iodine','Krypton','Waxwing']
+  const W37 = ['Neon','Oxygen']
   if(sc){
     const f=cands.filter(c=>{
       const code=c.cons||'', type=c.type||''
       if(sc==='6/1'||hasSt) return type==='ACSR'
       if(sc==='7')  return code.startsWith('7/') || ['Namu','Kutu'].includes(c.name) || type==='SCAC'
-      if(sc==='19') return code.startsWith('19/') || ['Rango','Weke','Helium','Iodine','Neon','Oxygen'].includes(c.name)
-      if(sc==='37') return code.startsWith('37/')
+      if(sc==='19') return code.startsWith('19/') || W19.includes(c.name)
+      if(sc==='37') return code.startsWith('37/') || W37.includes(c.name)
+      return true
+    })
+    if(f.length>0) cands=f
+  } else if(det && det.layer){
+    // visual strand-layer hint from the side-view ridges (soft filter)
+    const f=cands.filter(c=>{
+      const code=c.cons||''
+      if(det.layer==='o6') return code.startsWith('7/') || ['Namu','Kutu'].includes(c.name) || O6.includes(c.name) || c.type==='SCAC'
+      if(det.layer==='19') return code.startsWith('19/') || W19.includes(c.name)
+      if(det.layer==='37') return code.startsWith('37/') || W37.includes(c.name)
       return true
     })
     if(f.length>0) cands=f
@@ -68,6 +81,10 @@ export default function App(){
   const [strandMode,setStrandMode] = useState(false)  // true = next capture is for strand counting
   const [manualStrands,setManualStrands] = useState(null) // user-selected strand count override
   const [stiffness,setStiffness] = useState(null)        // 'flexible' | 'medium' | 'stiff'
+  const [autoCap,setAutoCap] = useState(true)             // auto-capture when reading is stable
+  const autoCapFired = useRef(false)                       // guard: fire once per stable lock
+  const stableTicks = useRef(0)                            // consecutive stable HUD updates
+  const captureRef = useRef(null)                          // late-bound capture()
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -113,6 +130,7 @@ export default function App(){
      runs on the clean frame, then overlays are drawn on top. No z-index issues. */
   useEffect(()=>{
     if(screen!=='camera') { setLiveMatch(null); stabilityBuf.current=[]; return; }
+    autoCapFired.current=false; stableTicks.current=0;
     let running=true, busy=false;
     function loop(){ if(!running) return; if(!busy){ busy=true; try{frame();}catch(e){console.error('AR:',e);}finally{busy=false;} } requestAnimationFrame(loop); }
     function frame(){
@@ -165,11 +183,21 @@ export default function App(){
         if(stable && !(liveMatch&&liveMatch.stable)) try{navigator.vibrate?.(30);}catch{}
         const m=computeMatch(dia,det.matHint,null,strandInfo,manualStrands,stiffness);
         setLiveMatch({dia,name:m.best.name==='\u2014'?m.best.cons:m.best.name,type:m.best.type,conf:m.conf,label:m.label,stable});
-      } else { stabilityBuf.current=[]; setLiveMatch(null); }
+        // ---- AUTO-CAPTURE: after sustained stability, take the shot automatically ----
+        if(autoCap && stable && !autoCapFired.current){
+          stableTicks.current++;
+          if(stableTicks.current>=4){           // ~1 s of solid lock
+            autoCapFired.current=true;
+            try{navigator.vibrate?.([40,60,40]);}catch{}
+            showToast('Locked — measuring\u2026');
+            captureRef.current && captureRef.current();
+          }
+        } else if(!stable){ stableTicks.current=0; }
+      } else { stabilityBuf.current=[]; setLiveMatch(null); stableTicks.current=0; }
     }
     const tid=setTimeout(loop,300);
     return ()=>{ running=false; clearTimeout(tid); };
-  },[screen,calBar,parallax,standoff,strandInfo,liveMatch])
+  },[screen,calBar,parallax,standoff,strandInfo,manualStrands,stiffness,liveMatch,autoCap,showToast])
 
   /* ---------- camera ---------- */
   // manual toggle (single attempt)
@@ -319,6 +347,7 @@ export default function App(){
       setTimeout(tryFullAuto,60)
     }
   },[savePhoto,tryFullAuto])
+  captureRef.current = capture
 
   /* ---------- measure-screen taps & drawing ---------- */
   const onTap = useCallback((ev)=>{
@@ -447,6 +476,10 @@ export default function App(){
                 <div className="hud" style={{zIndex:2}}>Fit the <b>whole card</b> in frame &middot; conductor in the clear channel</div>
               )}
             </div>
+            <label style={{display:'flex',alignItems:'center',gap:10,fontSize:13,color:'var(--dim)',padding:'2px 4px'}}>
+              <input type="checkbox" checked={autoCap} onChange={e=>setAutoCap(e.target.checked)} />
+              Auto-capture when the reading is stable (hands-free)
+            </label>
             <div className="cambar">
               <label>Cam</label>
               <select value={camId} onChange={e=>{ setCamId(e.target.value); startCamera(e.target.value) }}>
@@ -533,6 +566,23 @@ export default function App(){
             <div className="card">
               <h2>Measured diameter</h2>
               <div className="readout">{result.dia.toFixed(2)}<small> mm</small></div>
+              {detRef.current && (detRef.current.layer || detRef.current.bow>1.5) && (
+                <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
+                  {detRef.current.layer && (
+                    <div className="note" style={{borderColor:'var(--accent2)'}}>
+                      <b>Visual strand check:</b>{' '}
+                      {detRef.current.layer==='o6' && '~3 strand ridges visible → 6-outer construction (7-wire or 6/1 ACSR). 19/37-wire excluded.'}
+                      {detRef.current.layer==='19' && '~5 strand ridges visible → 19-wire class construction.'}
+                      {detRef.current.layer==='37' && '~7 strand ridges visible → 37-wire class construction.'}
+                    </div>
+                  )}
+                  {detRef.current.bow>1.5 && (
+                    <div className="note">
+                      <b>Lies curved on the card</b> ({detRef.current.bow.toFixed(1)} mm bow) — flexible conductors (AAC) tend to bow; ACSR lies straight. Consider tapping <b>Flexible</b> below.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <div className="card">
               <h2>Best match</h2>
