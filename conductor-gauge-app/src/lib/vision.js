@@ -1,3 +1,11 @@
+/* Copper colour detection — handles fresh (bright orange) and oxidised (dark brownish) copper.
+   Oxidised copper has lower saturation but retains a warm hue in the 10-65° range. */
+function isCopper(sat,hue,lum=128){
+  if(sat>0.18 && hue>=2 && hue<=62) return true;   // fresh/lightly oxidised copper
+  if(sat>0.09 && hue>=10 && hue<=55 && lum<160) return true; // dark oxidised copper
+  return false;
+}
+
 // Conductor Gauge — vision engine (framework-agnostic, validated).
 // Card geometry MUST match the printed marker card.
 export const CARD = [ {x:-75,y:50}, {x:75,y:50}, {x:75,y:-50}, {x:-75,y:-50} ]; // TL TR BR BL
@@ -133,7 +141,8 @@ export function detectConductor(shot, markers){
   let matHint="Aluminium";
   if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns, mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
     let h=0,d=mx-mn; if(d>0){ if(mx===Rr)h=60*(((Gg-Bb)/d)%6); else if(mx===Gg)h=60*(((Bb-Rr)/d)+2); else h=60*(((Rr-Gg)/d)+4);} if(h<0)h+=360;
-    if(S>0.16 && h>=2 && h<=55) matHint="Copper"; }
+    const Lm=0.299*Rr+0.587*Gg+0.114*Bb;
+    if(isCopper(S,h,Lm)) matHint="Copper"; }
   let bi=0,bd=1e9; for(let i=0;i<tt.length;i++){ const dd=Math.abs(tt[i].x); if(dd<bd){bd=dd;bi=i;} }
   const calA=toImg(tt[bi].x,tt[bi].y), calB=toImg(tb[bi].x,tb[bi].y);
   return { dia, matHint, calA, calB, topPts:tt, botPts:tb, Hinv, nScans:tw.length };
@@ -150,7 +159,7 @@ export function materialFromEdges(shot, edges){
       const d=ctx.getImageData(px,py,1,1).data; R+=d[0];G+=d[1];B+=d[2];n++; } }
   R/=n;G/=n;B/=n; const mx=Math.max(R,G,B),mn=Math.min(R,G,B),sat=mx?(mx-mn)/mx:0;
   let hue=0,dl=mx-mn; if(dl>0){ if(mx===R)hue=60*(((G-B)/dl)%6); else if(mx===G)hue=60*(((B-R)/dl)+2); else hue=60*(((R-G)/dl)+4);} if(hue<0)hue+=360;
-  return { material:(sat>0.16 && hue>=2 && hue<=55)?"Copper":"Aluminium", hue, sat };
+  return { material:isCopper(sat,hue,0.299*R+0.587*G+0.114*B)?"Copper":"Aluminium", hue, sat };
 }
 
 /* ---- FAST live-preview detector (for AR overlay, ~10x faster) ---- */
@@ -191,7 +200,8 @@ export function detectConductorLive(shot, markers){
   let matHint="Aluminium";
   if(ns){ const Rr=rs/ns,Gg=gs/ns,Bb=bs/ns,mx=Math.max(Rr,Gg,Bb),mn=Math.min(Rr,Gg,Bb),S=mx?(mx-mn)/mx:0;
     let h=0,d=mx-mn; if(d>0){if(mx===Rr)h=60*(((Gg-Bb)/d)%6);else if(mx===Gg)h=60*(((Bb-Rr)/d)+2);else h=60*(((Rr-Gg)/d)+4);}if(h<0)h+=360;
-    if(S>0.16&&h>=2&&h<=55) matHint="Copper"; }
+    const Lm=0.299*Rr+0.587*Gg+0.114*Bb;
+    if(isCopper(S,h,Lm)) matHint="Copper"; }
   let bi=0,bd=1e9;for(let i=0;i<topPts.length;i++){const dd=Math.abs(topPts[i].x);if(dd<bd){bd=dd;bi=i;}}
   const calA=toImg(topPts[bi].x,topPts[bi].y),calB=toImg(botPts[bi].x,botPts[bi].y);
   return {dia,matHint,calA,calB,topPts,botPts,Hinv,nScans:widths.length};

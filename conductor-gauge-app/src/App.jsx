@@ -26,19 +26,34 @@ function computeMatch(dia, material, det, strandInfo, manualStrands, stiffness){
     })
     if(f.length>0) cands=f
   }
-  // Stiffness filter
+  // Stiffness filter — hard filter if given
   if(stiffness){
     const sf=cands.filter(c=>c.stiffness===stiffness)
     if(sf.length>0) cands=sf
   }
-  cands.sort((a,b)=>a.err-b.err)
+  // Sort: by error first; on near-ties (<0.06mm) prefer the stiffness match
+  // This prevents Namu (AAC) from always beating Squirrel (ACSR) when they share a diameter
+  cands.sort((a,b)=>{
+    const d=a.err-b.err
+    if(Math.abs(d)<0.06 && stiffness){
+      const aOk=a.stiffness===stiffness?0:1, bOk=b.stiffness===stiffness?0:1
+      if(aOk!==bOk) return aOk-bOk
+    }
+    return d
+  })
   const best=cands[0], margin=cands[1]?(cands[1].err-best.err):99
+  // Detect ambiguous ties: same diameter, different conductor types (classic AAC vs ACSR)
+  const TIE=0.06
+  const tiedCands=cands.filter(c=>c.err<=best.err+TIE)
+  const ambiguous = tiedCands.length>1 && !stiffness && !manualStrands &&
+    new Set(tiedCands.map(c=>c.type)).size>1  // different types competing
   let conf='low', label='Low'
-  if(best.err<0.30 && margin>0.7){ conf='good'; label='High' }
+  if(ambiguous){ conf='low'; label='Ambiguous' }
+  else if(best.err<0.30 && margin>0.7){ conf='good'; label='High' }
   else if(best.err<0.6 && margin>0.35){ conf='med'; label='Medium' }
-  if(best.verified && best.err<0.25){ conf='good'; label='High (verified)' }
+  if(!ambiguous && best.verified && best.err<0.25){ conf='good'; label='High (verified)' }
   const src=(det&&det.topPts)?`Measured across ${det.nScans} scan lines.`:'Measured from edge taps.'
-  return { dia, best, cands:cands.slice(0,5), conf, label, margin, src, material }
+  return { dia, best, cands:cands.slice(0,5), conf, label, margin, src, material, ambiguous, tiedCands:tiedCands.slice(0,3) }
 }
 
 
@@ -495,6 +510,26 @@ export default function App(){
         {screen==='result' && result && (
           <>
             <div className="stage"><canvas ref={resRef}/></div>
+            {/* Ambiguity banner — shown when multiple conductor types share the same diameter */}
+            {result.ambiguous && (
+              <div style={{background:'rgba(255,112,49,.12)',border:'2px solid var(--accent)',borderRadius:14,padding:'16px 18px'}}>
+                <div style={{fontFamily:'Poppins,sans-serif',fontWeight:700,fontSize:14,color:'var(--accent)',marginBottom:8}}>
+                  ⚠ Multiple conductors match this diameter
+                </div>
+                <div style={{fontSize:13,color:'var(--ink)',marginBottom:12,lineHeight:1.5}}>
+                  {result.tiedCands.map(c=>c.name==='\u2014'?c.cons:c.name).join(' and ')} all measure {result.dia.toFixed(2)} mm.
+                  {' '}Use the <b>Stiffness</b> selector below to tell them apart.
+                </div>
+                <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                  {result.tiedCands.map((c,i)=>(
+                    <div key={i} style={{background:'var(--panel2)',borderRadius:10,padding:'10px 14px',fontSize:13}}>
+                      <b style={{color:'var(--ink)'}}>{c.name==='\u2014'?c.type+' '+c.cons:c.name}</b>
+                      <span style={{color:'var(--dim)',marginLeft:8}}>{c.type} · {c.stiffness==='flexible'?'Flexible (bends easily)':c.stiffness==='stiff'?'Stiff (barely bends)':'Medium stiffness'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="card">
               <h2>Measured diameter</h2>
               <div className="readout">{result.dia.toFixed(2)}<small> mm</small></div>
