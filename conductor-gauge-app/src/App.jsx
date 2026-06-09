@@ -85,6 +85,10 @@ export default function App(){
   const autoCapFired = useRef(false)                       // guard: fire once per stable lock
   const stableTicks = useRef(0)                            // consecutive stable HUD updates
   const captureRef = useRef(null)                          // late-bound capture()
+  const [covered,setCovered] = useState(false)             // conductor has covering/insulation
+  const [wall,setWall] = useState(1.5)                     // covering wall thickness mm per side
+  const pendDet = useRef(null)                             // detection awaiting confirm screen
+  const pendDia = useRef(0)                                // OD (scale/parallax corrected) awaiting confirm
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -302,18 +306,45 @@ export default function App(){
     const cb = Math.max(50, calBar||100)
     dia = dia * (cb/100)                       // print-scale correction from the calibration bar
     if(parallax){ const s=Math.max(60,standoff||250); dia=dia*(s-dia/2)/s }
-    detRef.current=det; diaRef.current=dia
+    detRef.current=det; pendDet.current=det; pendDia.current=dia
     const mat=det.matHint||material||'Aluminium'
     setMaterial(mat)
+    // pre-fill strand picker from the visual layer hint
+    if(det.layer==='o6' && !manualStrands) setManualStrands(null)  // o6 is ambiguous 7 vs 6/1 — leave for user
+    setScreen('confirm')   // quick questions before the result
+  },[parallax,standoff,calBar,material,manualStrands])
+
+  /* confirm-screen → compute the match with all user-supplied details */
+  const confirmProceed = useCallback(()=>{
+    const det=pendDet.current
+    let dia=pendDia.current
+    if(covered){ dia = Math.max(0.5, dia - 2*(wall||0)) }   // strip covering → bare-metal Ø
+    diaRef.current=dia
+    const mat=material||det?.matHint||'Aluminium'
     setResult(computeMatch(dia,mat,det,strandInfo,manualStrands,stiffness))
     setScreen('result')
-  },[parallax,standoff,calBar,material,strandInfo,manualStrands,stiffness])
+  },[covered,wall,material,strandInfo,manualStrands,stiffness])
+
+  const burstRef = useRef([])   // extra frames captured for the median measurement
 
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
-    let det=null; try{ det=detectConductor(shot,mk) }catch{}
-    if(det){ showToast('Conductor found & measured'); finalize(det); return true }
-    return false
+    const dets=[]
+    // main frame
+    try{ const d=detectConductor(shot,mk); if(d) dets.push(d) }catch{}
+    // burst frames — markers re-found per frame (slight hand motion between frames)
+    for(const c of burstRef.current){
+      try{
+        const m2=autoMarkers(c)||mk
+        const d=detectConductor(c,m2); if(d) dets.push(d)
+      }catch{}
+    }
+    if(!dets.length) return false
+    // median diameter wins; keep that frame's det for the overlay
+    dets.sort((a,b)=>a.dia-b.dia)
+    const det=dets[dets.length>>1]
+    showToast(dets.length>1?`Measured ${dets.length}× — median taken`:'Conductor found & measured')
+    finalize(det); return true
   },[finalize,showToast])
 
   const tryFullAuto = useCallback(()=>{
@@ -336,7 +367,16 @@ export default function App(){
     const v=videoRef.current; if(!v || !v.videoWidth) return
     const shot=shotRef.current; shot.width=v.videoWidth; shot.height=v.videoHeight
     shot.getContext('2d').drawImage(v,0,0,shot.width,shot.height)
-    if(streamRef.current){ streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; trackRef.current=null }
+    // burst: 2 extra frames ~120 ms apart for the median measurement
+    burstRef.current=[]
+    const grabBurst=(k)=>{ if(k>2 || !videoRef.current || !videoRef.current.videoWidth) return done()
+      const c=document.createElement('canvas'); c.width=v.videoWidth; c.height=v.videoHeight
+      c.getContext('2d').drawImage(v,0,0,c.width,c.height); burstRef.current.push(c)
+      if(k<2) setTimeout(()=>grabBurst(k+1),120); else done() }
+    const done=()=>{
+      if(streamRef.current){ streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; trackRef.current=null }
+      afterFrames() }
+    const afterFrames=()=>{
     setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setResult(null)
     setScreen('measure')
     savePhoto(shot,'conductor')
@@ -346,7 +386,9 @@ export default function App(){
     } else {
       setTimeout(tryFullAuto,60)
     }
-  },[savePhoto,tryFullAuto])
+    }
+    setTimeout(()=>grabBurst(1),120)
+  },[savePhoto,tryFullAuto,strandMode])
   captureRef.current = capture
 
   /* ---------- measure-screen taps & drawing ---------- */
@@ -475,6 +517,13 @@ export default function App(){
               ) : (
                 <div className="hud" style={{zIndex:2}}>Fit the <b>whole card</b> in frame &middot; conductor in the clear channel</div>
               )}
+              {/* circular camera-app shutter, floats above the HUD */}
+              <button className="shutter" onClick={capture} aria-label="Take photo">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#1D1D1D" strokeWidth="1.8">
+                  <path d="M3 8.5C3 7.7 3.7 7 4.5 7H7l1.4-2h7.2L17 7h2.5c.8 0 1.5.7 1.5 1.5v9c0 .8-.7 1.5-1.5 1.5h-15C3.7 19 3 18.3 3 17.5v-9z"/>
+                  <circle cx="12" cy="13" r="3.5"/>
+                </svg>
+              </button>
             </div>
             <label style={{display:'flex',alignItems:'center',gap:10,fontSize:13,color:'var(--dim)',padding:'2px 4px'}}>
               <input type="checkbox" checked={autoCap} onChange={e=>setAutoCap(e.target.checked)} />
@@ -487,8 +536,59 @@ export default function App(){
                 {cameras.map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
               </select>
             </div>
-            <button className="btn" onClick={capture}>📸 Take photo &amp; analyse</button>
             {camNote && <div className="note warn">{camNote}</div>}
+          </>
+        )}
+
+        {screen==='confirm' && (
+          <>
+            <div className="card">
+              <h2>Measured</h2>
+              <div className="readout" style={{fontSize:38}}>{pendDia.current.toFixed(2)}<small> mm OD</small></div>
+              {pendDet.current && (pendDet.current.ridge==null || pendDet.current.ridge<=1) && (
+                <p style={{marginTop:8,fontSize:12.5}}>No strand ridges visible in the photo — if this conductor has a covering, set it below so the bare-metal size is used for matching.</p>
+              )}
+            </div>
+
+            <div className="card">
+              <h2>Quick details</h2>
+              <p style={{marginBottom:14}}>Anything you can confirm sharpens the match. Skip what you don't know.</p>
+
+              <div className="strand-label">Material {pendDet.current?.matHint && <span style={{color:'var(--accent2)'}}>(detected: {pendDet.current.matHint})</span>}</div>
+              <div className="seg" style={{marginBottom:14}}>
+                {['Copper','Aluminium'].map(m=>
+                  <button key={m} className={material===m?'on':''} onClick={()=>setMaterial(m)}>{m}</button>)}
+              </div>
+
+              <div className="strand-label">Stiffness — flex it by hand</div>
+              <div className="seg" style={{marginBottom:14}}>
+                {[['flexible','Flexible'],['medium','Medium'],['stiff','Stiff']].map(([v,l])=>
+                  <button key={v} className={stiffness===v?'on':''} onClick={()=>setStiffness(stiffness===v?null:v)}>{l}</button>)}
+              </div>
+
+              <div className="strand-label">Strand count {pendDet.current?.layer && <span style={{color:'var(--accent2)'}}>(photo suggests {pendDet.current.layer==='o6'?'6-outer':pendDet.current.layer+'-wire'})</span>}</div>
+              <div className="seg strands" style={{marginBottom:14}}>
+                {[['?','?'],['7','7w'],['6/1','6/1'],['19','19w'],['37','37w']].map(([v,l])=>
+                  <button key={v} className={manualStrands===v?'on':''} onClick={()=>setManualStrands(manualStrands===v?null:v)}>{l}</button>)}
+              </div>
+
+              <div className="strand-label">Covering / insulation</div>
+              <div className="seg" style={{marginBottom:covered?10:0}}>
+                <button className={!covered?'on':''} onClick={()=>setCovered(false)}>Bare</button>
+                <button className={covered?'on':''} onClick={()=>setCovered(true)}>Covered</button>
+              </div>
+              {covered && (
+                <div className="field">
+                  <span>Covering wall thickness (per side)</span>
+                  <span><input type="number" step="0.1" min="0.3" max="4" value={wall}
+                    onChange={e=>setWall(parseFloat(e.target.value)||1.5)}/> mm</span>
+                </div>
+              )}
+              {covered && <p style={{fontSize:12,marginTop:6}}>Bare-metal Ø used for matching: <b style={{color:'var(--ink)'}}>{Math.max(0.5,pendDia.current-2*(wall||0)).toFixed(2)} mm</b></p>}
+            </div>
+
+            <button className="btn" onClick={confirmProceed}>Show result</button>
+            <button className="btn ghost" onClick={()=>{ setScreen('camera'); setResult(null); startCamera(camId) }}>Retake photo</button>
           </>
         )}
 
@@ -565,7 +665,8 @@ export default function App(){
             )}
             <div className="card">
               <h2>Measured diameter</h2>
-              <div className="readout">{result.dia.toFixed(2)}<small> mm</small></div>
+              <div className="readout">{result.dia.toFixed(2)}<small> mm{covered?' bare':''}</small></div>
+              {covered && <p style={{marginTop:6,fontSize:12.5}}>Overall OD {pendDia.current.toFixed(2)} mm − 2 × {(wall||0).toFixed(1)} mm covering. Matching uses the bare-metal size.</p>}
               {detRef.current && (detRef.current.layer || detRef.current.bow>1.5) && (
                 <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
                   {detRef.current.layer && (
@@ -722,7 +823,7 @@ export default function App(){
             </div>
             <button className="btn" onClick={saveResult}>💾 Save photo with result</button>
             <div className="row">
-              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setManualStrands(null); setStiffness(null); setTimeout(tryFullAuto,40) }}>Measure again</button>
+              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setManualStrands(null); setStiffness(null); setCovered(false); setTimeout(tryFullAuto,40) }}>Measure again</button>
               <button className="btn ghost" onClick={()=>startCamera()}>New photo</button>
             </div>
           </>
