@@ -118,6 +118,9 @@ export default function App(){
   const pendDet = useRef(null)                             // detection awaiting confirm screen
   const pendDia = useRef(0)                                // OD (scale/parallax corrected) awaiting confirm
   const [sceneWarn,setSceneWarn] = useState([])            // environment guardrail warnings
+  const [capturing,setCapturing] = useState(null)          // {k,total,tag} during 5-frame capture
+  const [framesInfo,setFramesInfo] = useState(null)        // per-frame diameters for comparison display
+  const capturingRef = useRef(false)                       // re-entry guard for capture()
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -373,8 +376,11 @@ export default function App(){
     // median diameter wins; keep that frame's det for the overlay
     dets.sort((a,b)=>a.dia-b.dia)
     const det=dets[dets.length>>1]
+    const dias=dets.map(d=>d.dia)
+    setFramesInfo({ dias, attempted:1+burstRef.current.length,
+      spread:dias.length>1 ? dias[dias.length-1]-dias[0] : 0, median:det.dia })
     setSceneWarn(sceneChecks(mk, shot.width, shot.height, det))
-    showToast(dets.length>1?`Measured ${dets.length}× — median taken`:'Conductor found & measured')
+    showToast(dets.length>1?`Compared ${dets.length} frames — median taken`:'Conductor found & measured')
     finalize(det); return true
   },[finalize,showToast])
 
@@ -394,62 +400,61 @@ export default function App(){
   },[runAuto])
 
   /* ---------- capture ---------- */
-  const capture = useCallback(()=>{
+  /* ---------- capture: ALWAYS 5 frames, deliberate pace, visible progress ----------
+     Frames 1-3: normal exposure, ~260 ms apart.
+     Frames 4-5: under- and over-exposed where the camera supports it;
+                 otherwise two more normal frames (still useful: noise voting).
+     Every frame is analysed; the median diameter wins. */
+  const capture = useCallback(async ()=>{
     const v=videoRef.current; if(!v || !v.videoWidth) return
-    const shot=shotRef.current; shot.width=v.videoWidth; shot.height=v.videoHeight
-    shot.getContext('2d').drawImage(v,0,0,shot.width,shot.height)
-    // full-sensor still where the browser supports it (Android Chrome):
-    // replaces the primary frame with a higher-resolution photo before analysis
-    try{
-      const track=trackRef.current
-      if(track && window.ImageCapture){
-        const ic=new ImageCapture(track)
-        ic.takePhoto().then(blob=>createImageBitmap(blob)).then(bm=>{
-          if(bm.width>shot.width){ shot.width=bm.width; shot.height=bm.height
-            shot.getContext('2d').drawImage(bm,0,0) }
-        }).catch(()=>{})
-      }
-    }catch{}
-    // bracketed burst: 2 extra normal frames, then (if supported) an under- and
-    // an over-exposed frame — 5 frames total. Specular blowout fails in the
-    // under-exposed frame? The others still vote. Dark strands invisible at
-    // normal exposure? The over-exposed frame catches them. Median wins.
+    if(capturingRef.current) return
+    capturingRef.current=true
+    const track=trackRef.current
+    const caps=track&&track.getCapabilities?track.getCapabilities():null
+    const evCap=caps&&caps.exposureCompensation?caps.exposureCompensation:null
+    const TOTAL=5
     burstRef.current=[]
-    const grabFrame=()=>{ const c=document.createElement('canvas');
-      c.width=v.videoWidth; c.height=v.videoHeight;
-      c.getContext('2d').drawImage(v,0,0,c.width,c.height); burstRef.current.push(c) }
-    const grabBurst=(k)=>{ if(k>2 || !videoRef.current || !videoRef.current.videoWidth) return bracket()
-      grabFrame()
-      if(k<2) setTimeout(()=>grabBurst(k+1),120); else bracket() }
-    const bracket=()=>{
-      const track=trackRef.current
-      const caps=track && track.getCapabilities ? track.getCapabilities() : null
-      if(!caps || !caps.exposureCompensation){ return done() }
-      const {min,max}=caps.exposureCompensation
-      const seq=[ {ev:min*0.6, tag:'under'}, {ev:max*0.6, tag:'over'} ]
-      const stepEV=(i)=>{
-        if(i>=seq.length){ track.applyConstraints({advanced:[{exposureCompensation:0}]}).catch(()=>{}); return done() }
-        track.applyConstraints({advanced:[{exposureCompensation:seq[i].ev}]})
-          .then(()=>setTimeout(()=>{ grabFrame(); stepEV(i+1) },280))
-          .catch(()=>done())
+    const shot=shotRef.current
+    const grab=(t)=>{ t.width=v.videoWidth; t.height=v.videoHeight
+      t.getContext('2d').drawImage(v,0,0,t.width,t.height) }
+    const sleep=ms=>new Promise(r=>setTimeout(r,ms))
+    try{
+      for(let k=1;k<=TOTAL;k++){
+        setCapturing({k,total:TOTAL,tag:k<=3?'normal':(k===4?'under-exposed':'over-exposed')})
+        if(evCap && k===4){ try{ await track.applyConstraints({advanced:[{exposureCompensation:evCap.min*0.6}]}); await sleep(320) }catch{} }
+        if(evCap && k===5){ try{ await track.applyConstraints({advanced:[{exposureCompensation:evCap.max*0.6}]}); await sleep(320) }catch{} }
+        if(k===1){
+          grab(shot)
+          // full-sensor still where supported (Android Chrome) — waited for, no race
+          if(window.ImageCapture && track){
+            try{
+              const bm=await Promise.race([
+                new ImageCapture(track).takePhoto().then(b=>createImageBitmap(b)),
+                sleep(700).then(()=>null) ])
+              if(bm && bm.width>shot.width){ shot.width=bm.width; shot.height=bm.height
+                shot.getContext('2d').drawImage(bm,0,0) }
+            }catch{}
+          }
+        } else {
+          const c=document.createElement('canvas'); grab(c); burstRef.current.push(c)
+        }
+        try{navigator.vibrate?.(15)}catch{}
+        if(k<TOTAL) await sleep(260)
       }
-      stepEV(0)
-    }
-    const done=()=>{
+    } finally {
+      if(evCap && track){ try{ track.applyConstraints({advanced:[{exposureCompensation:0}]}) }catch{} }
+      setCapturing(null)
+      capturingRef.current=false
       if(streamRef.current){ streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; trackRef.current=null }
-      afterFrames() }
-    const afterFrames=()=>{
-    setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setResult(null)
+    }
+    setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setResult(null); setFramesInfo(null)
     setScreen('measure')
     savePhoto(shot,'conductor')
     if(strandMode){
-      // strand counting mode: user taps the centre of the conductor cross-section
       setInstr({text:'Tap the CENTRE of the conductor cross-section. The app will count the strands.', warn:false})
     } else {
       setTimeout(tryFullAuto,60)
     }
-    }
-    setTimeout(()=>grabBurst(1),120)
   },[savePhoto,tryFullAuto,strandMode])
   captureRef.current = capture
 
@@ -579,8 +584,15 @@ export default function App(){
               ) : (
                 <div className="hud" style={{zIndex:2}}>Fit the <b>whole card</b> in frame &middot; conductor in the clear channel</div>
               )}
+              {capturing && (
+                <div className="capover">
+                  <div className="capnum">{capturing.k} / {capturing.total}</div>
+                  <div className="capbar"><div style={{width:(capturing.k/capturing.total*100)+'%'}}/></div>
+                  <div className="caplbl">Capturing {capturing.tag} frame…</div>
+                </div>
+              )}
               {/* circular camera-app shutter, floats above the HUD */}
-              <button className="shutter" onClick={capture} aria-label="Take photo">
+              <button className="shutter" onClick={capture} disabled={!!capturing} style={capturing?{opacity:.35}:undefined} aria-label="Take photo">
                 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#1D1D1D" strokeWidth="1.8">
                   <path d="M3 8.5C3 7.7 3.7 7 4.5 7H7l1.4-2h7.2L17 7h2.5c.8 0 1.5.7 1.5 1.5v9c0 .8-.7 1.5-1.5 1.5h-15C3.7 19 3 18.3 3 17.5v-9z"/>
                   <circle cx="12" cy="13" r="3.5"/>
@@ -607,6 +619,30 @@ export default function App(){
             {sceneWarn.length>0 && (
               <div className="note warn">
                 {sceneWarn.map((w,i)=><div key={i} style={{marginBottom:i<sceneWarn.length-1?6:0}}>⚠ {w}</div>)}
+              </div>
+            )}
+            {framesInfo && (
+              <div className="card">
+                <h2>Frame comparison</h2>
+                <p style={{marginBottom:10}}>
+                  {framesInfo.dias.length} of {framesInfo.attempted} frames measured successfully — median taken.
+                </p>
+                <div style={{display:'flex',flexWrap:'wrap',gap:7}}>
+                  {framesInfo.dias.map((d,i)=>(
+                    <span key={i} className="pill" style={{
+                      background: Math.abs(d-framesInfo.median)<0.001 ? 'rgba(5,196,137,.2)' : 'var(--panel2)',
+                      color: Math.abs(d-framesInfo.median)<0.001 ? 'var(--good)' : 'var(--dim)',
+                      fontSize:11, padding:'6px 11px', letterSpacing:'.02em'}}>
+                      {d.toFixed(2)}
+                    </span>
+                  ))}
+                </div>
+                <p style={{marginTop:10,fontSize:12.5}}>
+                  Spread {framesInfo.spread.toFixed(2)} mm
+                  {framesInfo.spread<=0.15 ? ' — excellent agreement.' :
+                   framesInfo.spread<=0.30 ? ' — good agreement.' :
+                   ' — frames disagree more than usual. Consider retaking with steadier hands / better light.'}
+                </p>
               </div>
             )}
             <div className="card">

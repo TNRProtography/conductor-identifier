@@ -196,3 +196,12 @@ footer .brand-foot{color:var(--accent2); font-weight:700; font-family:"Poppins",
   background-clip:padding-box; display:flex; align-items:center; justify-content:center;
   box-shadow:0 2px 14px rgba(0,0,0,.45); transition:transform .08s;}
 .shutter:active{transform:translateX(-50%) scale(.92);}
+
+/* 5-frame capture progress */
+.capover{position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  background:rgba(26,46,43,.92); border:1px solid var(--line); border-radius:16px;
+  padding:18px 26px; text-align:center; z-index:5; min-width:180px;}
+.capnum{font-family:"Poppins",sans-serif; font-size:30px; font-weight:700; color:var(--accent2);}
+.capbar{height:5px; background:var(--panel3); border-radius:99px; margin:10px 0 8px; overflow:hidden;}
+.capbar>div{height:100%; background:var(--accent2); border-radius:99px; transition:width .2s;}
+.caplbl{font-size:11px; color:var(--dim); letter-spacing:.08em; text-transform:uppercase; font-family:"Poppins",sans-serif;}
