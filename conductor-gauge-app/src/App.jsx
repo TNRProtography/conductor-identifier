@@ -9,34 +9,33 @@ import {
 const stamp = () => { const d=new Date(), p=n=>String(n).padStart(2,'0')
   return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()) }
 
-function computeMatch(dia, material, det, strandInfo){
-  // Enhance table with any verified (learned) diameters
+function computeMatch(dia, material, det, strandInfo, manualStrands){
   const enhanced = applyVerified(TABLE)
   let cands = enhanced.filter(c=>c.mat===material).map(c=>({ ...c, err:Math.abs(c.dia-dia) }))
-  // If strand count known, filter to matching constructions
-  if(strandInfo && strandInfo.count){
-    const sc=strandInfo.count; const hasS=strandInfo.hasSteel;
-    const strandMatch = cands.filter(c=>{
-      // 6/1 ACSR = 7 strands with steel; 7-wire Cu/AAC = 7 no steel; 19-wire = 19; 37-wire = 37
-      const code=c.cons||''; const n=parseInt(code); const type=c.type||'';
-      if(sc<=8 && hasS && type==='ACSR') return true;
-      if(sc<=8 && !hasS && type!=='ACSR') return true;
-      if(sc>=17 && sc<=20) return code.startsWith('19') || type==='AAAC' || type==='AAC';
-      if(sc>=35 && sc<=39) return code.startsWith('37');
-      return true; // uncertain count → don't filter
-    });
-    if(strandMatch.length>0) cands=strandMatch;
+  // Strand filter: manual entry takes priority over auto-detected
+  const sc = manualStrands || (strandInfo && strandInfo.count && String(strandInfo.count))
+  const hasSt = manualStrands==='6/1' || (strandInfo && strandInfo.hasSteel && !manualStrands)
+  if(sc){
+    const f=cands.filter(c=>{
+      const code=c.cons||'', type=c.type||''
+      if(sc==='6/1'||hasSt) return type==='ACSR'
+      if(sc==='7')  return code.startsWith('7/') || ['Namu','Kutu'].includes(c.name) || type==='SCAC'
+      if(sc==='19') return code.startsWith('19/') || ['Rango','Weke','Helium','Iodine','Neon','Oxygen'].includes(c.name)
+      if(sc==='37') return code.startsWith('37/')
+      return true
+    })
+    if(f.length>0) cands=f
   }
-  cands.sort((a,b)=>a.err-b.err);
-  const best=cands[0], margin = cands[1] ? (cands[1].err-best.err) : 99;
-  let conf='low', label='Low';
+  cands.sort((a,b)=>a.err-b.err)
+  const best=cands[0], margin=cands[1]?(cands[1].err-best.err):99
+  let conf='low', label='Low'
   if(best.err<0.30 && margin>0.7){ conf='good'; label='High' }
   else if(best.err<0.6 && margin>0.35){ conf='med'; label='Medium' }
-  // Boost confidence if verified
   if(best.verified && best.err<0.25){ conf='good'; label='High (verified)' }
-  const src = (det && det.topPts) ? `Measured across ${det.nScans} scan lines.` : 'Measured from edge taps.'
-  return { dia, best, cands:cands.slice(0,4), conf, label, margin, src, material }
+  const src=(det&&det.topPts)?`Measured across ${det.nScans} scan lines.`:'Measured from edge taps.'
+  return { dia, best, cands:cands.slice(0,5), conf, label, margin, src, material }
 }
+
 
 export default function App(){
   const [screen,setScreen]   = useState('intro')   // intro | camera | measure | result
@@ -46,7 +45,8 @@ export default function App(){
   const [material,setMaterial] = useState(null)
   const [result,setResult]   = useState(null)
   const [strandInfo,setStrandInfo] = useState(null)   // from end-on strand counting
-  const [strandMode,setStrandMode] = useState(false) // true = next capture is for strand counting
+  const [strandMode,setStrandMode] = useState(false)  // true = next capture is for strand counting
+  const [manualStrands,setManualStrands] = useState(null) // user-selected strand count override
   const [cameras,setCameras] = useState([])
   const [camId,setCamId]     = useState('')
   const [torch,setTorch]     = useState({capable:false,on:false})
@@ -142,7 +142,7 @@ export default function App(){
         if(buf.length>=5){ const avg=buf.reduce((a,b)=>a+b)/buf.length;
           const std=Math.sqrt(buf.reduce((a,b)=>a+(b-avg)**2,0)/buf.length); stable=std<0.18; }
         if(stable && !(liveMatch&&liveMatch.stable)) try{navigator.vibrate?.(30);}catch{}
-        const m=computeMatch(dia,det.matHint,null,strandInfo);
+        const m=computeMatch(dia,det.matHint,null,strandInfo,manualStrands);
         setLiveMatch({dia,name:m.best.name==='\u2014'?m.best.cons:m.best.name,type:m.best.type,conf:m.conf,label:m.label,stable});
       } else { stabilityBuf.current=[]; setLiveMatch(null); }
     }
@@ -256,9 +256,9 @@ export default function App(){
     detRef.current=det; diaRef.current=dia
     const mat=det.matHint||material||'Aluminium'
     setMaterial(mat)
-    setResult(computeMatch(dia,mat,det,strandInfo))
+    setResult(computeMatch(dia,mat,det,strandInfo,manualStrands))
     setScreen('result')
-  },[parallax,standoff,calBar,material,strandInfo])
+  },[parallax,standoff,calBar,material,strandInfo,manualStrands])
 
   const runAuto = useCallback((mk)=>{
     const shot=shotRef.current
@@ -355,7 +355,7 @@ export default function App(){
       const H=homography(markers,CARD), a=applyH(H,edges[0]), b=applyH(H,edges[1])
       finalize({ dia:Math.hypot(a.x-b.x,a.y-b.y), matHint:material, calA:edges[0], calB:edges[1], topPts:null }) } }
   }
-  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current,strandInfo)) }
+  const overrideMaterial = (m)=>{ setMaterial(m); setResult(computeMatch(diaRef.current,m,detRef.current,strandInfo,manualStrands)) }
   const saveResult = ()=>{
     const shot=shotRef.current; const c=document.createElement('canvas'); c.width=shot.width; c.height=shot.height
     const banner = result ? `${result.best.name==='\u2014'?result.best.cons:result.best.name}  \u00b7  ${result.best.type}  \u00b7  ${result.best.csa} mm\u00b2  \u00b7  ${result.label} confidence` : ''
@@ -382,8 +382,16 @@ export default function App(){
   return (
     <>
       <header>
-        <svg className="logo" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#e5007d" strokeWidth="2"/><circle cx="12" cy="12" r="3.4" fill="#19d3a2"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3" stroke="#19d3a2" strokeWidth="2"/></svg>
-        <div><h1>Conductor Gauge</h1><div className="sub">camera sizing</div></div>
+        <div className="wp-logo">
+          <svg width="34" height="28" viewBox="0 0 34 28" fill="none">
+            <path d="M6 22C6 13 13 7 24 5C20 13 12 19 6 22Z" fill="#05C489"/>
+            <path d="M10 26.5C14 18 24 13.5 33 13.5C26.5 19.5 17 24 10 26.5Z" fill="#05C489" opacity="0.65"/>
+          </svg>
+          <div className="wp-wordmark">
+            <span className="name">Westpower</span>
+            <span className="sub">Conductor Gauge</span>
+          </div>
+        </div>
       </header>
 
       <main>
@@ -391,8 +399,10 @@ export default function App(){
           <>
             <div className="card">
               <h2>What this does</h2>
-              <p>Identifies a stranded conductor from a photo, by measuring its diameter against the printed <strong>marker card</strong> and reading its colour. Print the card at 100%, lay the conductor along the clear channel, and shoot from directly above with the whole card in frame.</p>
-              <button className="btn" onClick={()=>startCamera()}>Start camera</button>
+              <p className="intro-lead">We keep the lights on.<br/>You keep the lines right.</p>
+              <p>Lay the conductor on the <strong>marker card</strong>, point the camera, and the app measures its diameter and identifies it from the Westpower conductor database — live, on the card.</p>
+              <p>Print the card at 100%, lay the conductor in the clear channel, and shoot with the whole card in frame.</p>
+              <button className="btn" onClick={()=>startCamera()}>Get started</button>
             </div>
             {canInstall && <button className="btn ghost" onClick={installApp}>⤓ Install app</button>}
             <div className="note warn">Decision-support prototype. Confirm a critical size with calipers or the printed cable marking before relying on it.</div>
@@ -405,10 +415,10 @@ export default function App(){
             <video ref={videoRef} playsInline autoPlay muted style={{position:'absolute',width:1,height:1,opacity:0,pointerEvents:'none'}}/>
             <div className="stage" style={{position:'relative'}}>
               <canvas ref={overlayRef} style={{display:'block',width:'100%'}}/>
-              <button className={'flashbtn'+(torch.on?' on':'')} onClick={()=>tryTorch(!torch.on)} style={{zIndex:3}}>
+              <button className={'cam-ctrl right'+(torch.on?' on':'')} onClick={()=>tryTorch(!torch.on)} style={{zIndex:3}}>
                 <span>⚡</span><span>{torch.on?'Flash ON':'Flash'}</span>
               </button>
-              <button className="flashbtn" onClick={doFocus} style={{left:10,right:'auto',zIndex:3}}>
+              <button className="cam-ctrl" onClick={doFocus} style={{left:10,right:'auto',zIndex:3}}>
                 <span>🔍</span><span>Focus</span>
               </button>
               {liveMatch ? (
@@ -498,10 +508,10 @@ export default function App(){
                 <span className={'pill '+result.conf}>{result.label} confidence</span>
                 {result.best.est && <span className="pill med" style={{fontSize:9}}>Ø estimated</span>}
               </div>
-              <div className="kv"><span>Construction</span><span className="mono">{result.best.type}{result.best.cons && result.best.cons!==result.best.name ? '  ·  '+result.best.cons : ''}</span></div>
-              <div className="kv"><span>Material</span><span className="mono"><span className={'matchip '+chip(result.best.mat)}/>{result.best.mat}</span></div>
-              <div className="kv"><span>Cross-sectional area</span><span className="mono">{result.best.csa} mm²</span></div>
-              <div className="kv"><span>Nominal Ø / measured</span><span className="mono">{result.best.dia.toFixed(2)}{result.best.est?' (est)':''} / {result.dia.toFixed(2)} mm</span></div>
+              <div className="kv"><span className="label">Construction</span><span className="value">{result.best.type}{result.best.cons && result.best.cons!==result.best.name ? '  ·  '+result.best.cons : ''}</span></div>
+              <div className="kv"><span className="label">Material</span><span className="value"><span className={'matchip '+chip(result.best.mat)}/>{result.best.mat}</span></div>
+              <div className="kv"><span className="label">Cross-sectional area</span><span className="value">{result.best.csa} mm²</span></div>
+              <div className="kv"><span className="label">Nominal Ø / measured</span><span className="value">{result.best.dia.toFixed(2)}{result.best.est?' (est)':''} / {result.dia.toFixed(2)} mm</span></div>
               <div style={{marginTop:12}}>
                 <div className="sub" style={{fontSize:10,color:'var(--dim)',letterSpacing:'.12em',textTransform:'uppercase',marginBottom:6}}>Material wrong? Override:</div>
                 <div className="seg">
@@ -526,7 +536,28 @@ export default function App(){
                : 'Low confidence — sits between sizes or detection was noisy. Re-shoot flatter with flash on, and verify with calipers.'}
               {result.best.est && <> <b>This conductor’s reference Ø is estimated from CSA</b> — confirm against the datasheet.</>}
             </div>
-            {/* ---- CONFIRM / CORRECT identification (learns for future matches) ---- */}
+            {/* ---- STRAND COUNT — manual override ---- */}
+            <div className="card">
+              <h2>Strand count</h2>
+              <p style={{marginBottom:10}}>Count the strands by eye or from a cut end and select below — this narrows the match significantly.</p>
+              <div className="seg strands">
+                {[['?','Unknown'],['7','7-wire'],['6/1','6/1 ACSR'],['19','19-wire'],['37','37-wire']].map(([v,lbl])=>(
+                  <button key={v} className={manualStrands===v?'on':''} onClick={()=>{
+                    const next=manualStrands===v?null:v; setManualStrands(next);
+                    setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,next));
+                  }}>{lbl}</button>
+                ))}
+              </div>
+              {manualStrands && manualStrands!=='?' && (
+                <p style={{marginTop:8,fontSize:12}}>
+                  {manualStrands==='6/1' && 'Filtering to ACSR conductors (6 Al strands + 1 steel core).'}
+                  {manualStrands==='7'   && '7-wire: Cu HD, AAC (Namu/Kutu), or SCAC.'}
+                  {manualStrands==='19'  && '19-wire: larger Cu HD, AAC (Rango/Weke), or AAAC.'}
+                  {manualStrands==='37'  && '37-wire: Cu HD 37/.072 (95 mm²).'}
+                </p>
+              )}
+            </div>
+            {/* ---- CONFIRM / CORRECT identification ---- */}
             <div className="card">
               <h2>Confirm identification</h2>
               <p>Confirming builds a verified diameter database from your real conductors — future matches get more accurate.</p>
@@ -537,12 +568,12 @@ export default function App(){
                 ✓ This is {result.best.name==='—'?result.best.cons:result.best.name}
               </button>
               <p style={{fontSize:12,color:'var(--dim)'}}>Wrong? Select the correct conductor:</p>
-              <select style={{width:'100%',padding:10,borderRadius:10,background:'var(--panel2)',color:'var(--ink)',border:'1px solid var(--line)',fontFamily:'inherit',fontSize:13}}
+              <select className="confirm-select"
                 onChange={e=>{ if(e.target.value){
                   confirmMeasurement(e.target.value, result.dia);
                   showToast('Corrected → stored under '+e.target.value);
                   // re-match with updated verified data
-                  setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo));
+                  setResult(computeMatch(diaRef.current,result.material,detRef.current,strandInfo,manualStrands));
                   e.target.value=''; } }}>
                 <option value="">— select correct conductor —</option>
                 {TABLE.map(c=>{
@@ -575,7 +606,7 @@ export default function App(){
             </div>
             <button className="btn" onClick={saveResult}>💾 Save photo with result</button>
             <div className="row">
-              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setTimeout(tryFullAuto,40) }}>Measure again</button>
+              <button className="btn ghost" onClick={()=>{ setScreen('measure'); setMarkers([]); setEdges([]); setMaterial(null); setPhase('markers'); setManualStrands(null); setTimeout(tryFullAuto,40) }}>Measure again</button>
               <button className="btn ghost" onClick={()=>startCamera()}>New photo</button>
             </div>
           </>
@@ -583,8 +614,8 @@ export default function App(){
       </main>
 
       <footer>
-        Conductor Gauge · estimates only · verify before use.<br/>
-        Diameters for named aluminium conductors are estimated from CSA — refine with datasheet values.
+        <span className="brand-foot">Westpower</span> Conductor Gauge · estimates only, verify before use.<br/>
+        Named aluminium diameters estimated from CSA — confirm with datasheet.
       </footer>
 
       <div className={'toast'+(toast?' show':'')}>{toast}</div>
